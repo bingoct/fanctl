@@ -1,0 +1,19 @@
+# Build artefacts
+/target/
+
+# Agent / tooling workspace (local test harnesses, scratch files)
+/.workbuddy/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Rust backup files
+**/*.rs.bk
+
+# NOTE: Cargo.lock is committed on purpose - `fanctl` is a binary crate and
+# deployments must be reproducible.

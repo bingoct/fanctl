@@ -1,0 +1,42 @@
+[package]
+name = "fanctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+resolver = "3"
+description = "Hardware-agnostic IPMI fan control daemon for server boards"
+keywords = ["ipmi", "fan", "daemon", "server", "pwm"]
+categories = ["command-line-utilities", "hardware-support"]
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+nvml-wrapper = { version = "0.10", optional = true }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.3"
+thiserror = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["gpu"]
+# NVIDIA temperature support. Disable with `--no-default-features` on hosts
+# without the NVIDIA driver: the control loop then ignores `monitor_sources = ["GPU"]`.
+gpu = ["dep:nvml-wrapper"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,6 @@
+# The deployment target is Linux: keep one canonical LF line ending so that
+# `cargo fmt --check` and the committed bytes agree everywhere.
+* text=auto eol=lf
+
+*.exe binary
+*.pdb binary
