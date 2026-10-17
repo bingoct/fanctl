@@ -1,0 +1,76 @@
+# fanctl - business logic: zones, curves, coupling
+#
+# Semantics only. Pin names and sensor names are resolved through platform.toml.
+# Documented in README.md; validate with `fanctl check`.
+
+[global]
+interval_seconds = 10        # sampling period (seconds)
+min_pwm = 25                 # hard floor, fans never stop
+max_pwm = 100                # hard ceiling
+fallback_pwm = 60            # used when no sensor can be read at all
+# shutdown_pwm = 40          # pushed to every pin on SIGINT/SIGTERM (default 40)
+# command_timeout_seconds = 5  # deadline for one ipmitool invocation (default 5)
+
+# --- coupling: case fans must never be slower than the CPU fan --------------
+[[follows]]
+pin = "SYS_FAN_1"
+min_of = "CPU_FAN"
+
+[[follows]]
+pin = "SYS_FAN_2"
+min_of = "CPU_FAN"
+
+# --- zone 1: CPU heatsink ---------------------------------------------------
+[[zones]]
+name = "cpu_zone"
+monitor_sources = ["CPU_Tctl"]
+aggregation = "max"
+target_pins = ["CPU_FAN"]
+default_duty_cycle = 30      # standby, below the first threshold
+debounce_temp = 2            # hysteresis applied only when dropping a step
+
+[[zones.thresholds]]
+temperature = 55
+duty_cycle = 40
+
+[[zones.thresholds]]
+temperature = 70
+duty_cycle = 60
+
+[[zones.thresholds]]
+temperature = 85
+duty_cycle = 100
+
+# --- zone 2: intake, feeds the heatsink and the GPUs ------------------------
+[[zones]]
+name = "intake_zone"
+monitor_sources = ["CPU_Tctl", "GPU"]   # highest of CPU and all GPUs
+aggregation = "max"
+target_pins = ["SYS_FAN_1"]
+default_duty_cycle = 30
+debounce_temp = 2
+
+[[zones.thresholds]]
+temperature = 60
+duty_cycle = 45
+
+[[zones.thresholds]]
+temperature = 75
+duty_cycle = 65
+
+# --- zone 3: exhaust, clears VRM and case heat ------------------------------
+[[zones]]
+name = "exhaust_zone"
+monitor_sources = ["CPU_Tctl", "CPU_MOSFET", "SYS_Air_Outlet"]
+aggregation = "max"
+target_pins = ["SYS_FAN_2"]
+default_duty_cycle = 30
+debounce_temp = 2
+
+[[zones.thresholds]]
+temperature = 55
+duty_cycle = 40
+
+[[zones.thresholds]]
+temperature = 70
+duty_cycle = 60

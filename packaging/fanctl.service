@@ -1,0 +1,40 @@
+[Unit]
+Description=fanctl - IPMI fan control daemon
+Documentation=file:/usr/local/share/doc/fanctl/README.md
+# The BMC must be reachable before the first cycle runs.
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/fanctl/config.toml
+ConditionPathExists=/etc/fanctl/platform.toml
+
+[Service]
+Type=simple
+# fanctl logs to stdout; systemd puts that into the journal.
+ExecStart=/usr/local/bin/fanctl run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+# ipmitool opens /dev/ipmi0 directly, which needs root (or a udev rule plus
+# CAP_SYS_RAWIO). Running as root is the supported configuration.
+User=root
+Group=root
+
+# Modest sandboxing. Do NOT add PrivateDevices=yes or ProtectKernelTunables
+# style options that hide /dev/ipmi*: the daemon would lose the BMC and start
+# logging "could not run ipmitool" every cycle.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+# SIGTERM lets fanctl write [global].shutdown_pwm (default 40 %) to every pin
+# before exiting. The BMC keeps the last value written, so stopping the unit
+# never leaves the fans at an extreme setting. TimeoutStopSec must stay larger
+# than one ipmitool timeout, otherwise systemd kills the daemon mid-shutdown.
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

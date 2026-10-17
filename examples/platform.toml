@@ -1,0 +1,24 @@
+# fanctl - hardware description for Tyan S8030 (AMD EPYC 7003)
+#
+# This file is the only place that knows raw BMC addresses. Nothing here may be
+# hard coded in the daemon binary.
+#
+# Verify with:  fanctl check -p examples/platform.toml -c examples/config.toml
+
+[platform]
+name = "Tyan S8030"
+# {id}  = pin id from [pins], e.g. 0x00
+# {pwm} = duty cycle as a hex byte, e.g. 0x28 for 40 %
+cmd_template = "raw 0x2e 0x44 0xfd 0x19 0x00 {id} 0x01 {pwm}"
+# ipmitool_path = "/usr/bin/ipmitool"   # default: whatever is in $PATH
+
+[pins]
+"CPU_FAN"   = "0x00"
+"SYS_FAN_1" = "0x02"
+"SYS_FAN_2" = "0x03"
+
+[sensors]
+# semantic name  ->  name printed by `ipmitool sdr`
+"CPU_Tctl"       = "CPU_Tctl_Value"
+"CPU_MOSFET"     = "CPU_MOSFET"
+"SYS_Air_Outlet" = "SYS_Air_Outlet"
