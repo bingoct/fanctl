@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::FollowRule;
+use crate::config::{FollowRule, ZoneConfig};
 
 /// Pin -> duty cycle map under construction.
 #[derive(Debug, Default, Clone)]
@@ -91,15 +91,45 @@ impl TargetMap {
     }
 }
 
+/// Standby duty cycle of every pin the daemon drives, used on shutdown.
+///
+/// Each controlled pin falls back to its zone's `default_duty_cycle` - the same
+/// value the curve uses below the first threshold. A pin driven by several
+/// zones takes the highest one, matching the conflict rule above. Pins that no
+/// zone drives are absent on purpose: the daemon never wrote them, so inventing
+/// a value on the way out would add risk instead of restoring anything.
+pub fn standby_targets(zones: &[ZoneConfig], min: u8, max: u8) -> TargetMap {
+    let mut targets = TargetMap::new();
+    for zone in zones {
+        for pin in &zone.target_pins {
+            targets.raise(pin, zone.default_duty_cycle);
+        }
+    }
+    targets.clamp(min, max);
+    targets
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TargetMap;
-    use crate::config::FollowRule;
+    use super::{standby_targets, TargetMap};
+    use crate::config::{Aggregation, FollowRule, ZoneConfig};
 
     fn rule(pin: &str, min_of: &str) -> FollowRule {
         FollowRule {
             pin: pin.to_string(),
             min_of: min_of.to_string(),
+        }
+    }
+
+    fn zone(name: &str, pin: &str, default_duty_cycle: u8) -> ZoneConfig {
+        ZoneConfig {
+            name: name.to_string(),
+            monitor_sources: vec!["CPU_Tctl".to_string()],
+            aggregation: Aggregation::Max,
+            target_pins: vec![pin.to_string()],
+            default_duty_cycle,
+            debounce_temp: 2.0,
+            thresholds: Vec::new(),
         }
     }
 
@@ -158,5 +188,26 @@ mod tests {
         map.raise("CPU_FAN", 60);
         map.clamp(90, 25);
         assert_eq!(map.get("CPU_FAN"), Some(60));
+    }
+
+    #[test]
+    fn standby_uses_each_zone_default_and_skips_unmanaged_pins() {
+        let zones = vec![zone("cpu", "CPU_FAN", 30), zone("exhaust", "SYS_FAN_1", 45)];
+        let map = standby_targets(&zones, 25, 100);
+        assert_eq!(map.get("CPU_FAN"), Some(30));
+        assert_eq!(map.get("SYS_FAN_1"), Some(45));
+        assert_eq!(map.get("SYS_FAN_2"), None);
+    }
+
+    #[test]
+    fn standby_takes_the_highest_default_on_a_shared_pin() {
+        let zones = vec![zone("a", "CPU_FAN", 30), zone("b", "CPU_FAN", 60)];
+        assert_eq!(standby_targets(&zones, 25, 100).get("CPU_FAN"), Some(60));
+    }
+
+    #[test]
+    fn standby_respects_the_global_floor() {
+        let zones = vec![zone("a", "CPU_FAN", 10)];
+        assert_eq!(standby_targets(&zones, 25, 100).get("CPU_FAN"), Some(25));
     }
 }

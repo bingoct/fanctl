@@ -28,7 +28,11 @@ impl LoadedConfig {
     /// reports every mistake instead of one per attempt.
     pub fn load(policy_path: &Path, platform_path: &Path) -> Result<Self, Error> {
         let platform: PlatformConfig = read_toml(platform_path)?;
-        let policy: FanConfig = read_toml(policy_path)?;
+        let mut policy: FanConfig = read_toml(policy_path)?;
+        // Names are case-insensitive: fold every reference onto the spelling
+        // declared in `platform.toml` before validating, so that `cpu_fan` and
+        // `CPU_FAN` cannot end up as two different pins downstream.
+        policy.resolve_names(&platform);
 
         let mut problems = platform.validate();
         problems.extend(policy.validate(&platform));

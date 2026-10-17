@@ -6,7 +6,7 @@
 目标环境：**Tyan S8030 + AMD EPYC 7413 + NVIDIA GPU**，Linux + systemd。
 硬件差异全部落在 `platform.toml`，控制逻辑里没有一处十六进制常量。
 
-当前状态：`cargo build` / `cargo test`（34 个测试）/ `cargo clippy --all-targets`（零告警）/
+当前状态：`cargo build` / `cargo test`（45 个测试）/ `cargo clippy --all-targets`（零告警）/
 `cargo fmt --check` 全部通过；控制循环已用假的 `ipmitool` 做过端到端验证。
 **尚未在真实 BMC 上跑过**，上机前务必先跑 `check` 与 `--dry-run`（见"安全须知"）。
 
@@ -58,6 +58,7 @@ fanctl/
 │   ├── cli.rs                 # clap 定义
 │   ├── error.rs               # thiserror 单错误类型
 │   ├── logging.rs             # tracing → stdout（journald）
+│   ├── name.rs                # 名字归一化（大小写不敏感）
 │   ├── process.rs             # 带超时的子进程执行
 │   ├── actuator.rs            # 唯一写主板的地方（渲染模板 + ipmitool）
 │   ├── config/
@@ -87,35 +88,48 @@ fanctl/
 
 ### 3.1 `platform.toml` — 硬件适配层
 
-| 字段 | 说明 |
-|------|------|
-| `[platform].name` | 板名，仅用于日志 |
-| `[platform].cmd_template` | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
-| `[platform].ipmitool_path` | 可选，默认 `ipmitool`（走 `$PATH`） |
-| `[pins]` | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
-| `[sensors]` | 语义名 → `ipmitool sdr` 打印的名字 |
+| 字段 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `[platform].name` | 是 | — | 板名，仅用于日志 |
+| `[platform].cmd_template` | 是 | — | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
+| `[platform].ipmitool_path` | 否 | `ipmitool`（走 `$PATH`） | 建议在服务器上写绝对路径 |
+| `[pins]` | 是，≥1 条 | — | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
+| `[sensors]` | 是，≥1 条 | — | 语义名 → `ipmitool sdr` 打印的名字；不允许占用 `GPU` |
 
 ### 3.2 `config.toml` — 业务逻辑层
 
-| 字段 | 说明 |
-|------|------|
-| `[global].interval_seconds` | 采样周期，≥1 |
-| `[global].min_pwm` / `max_pwm` | 全局上下限，`min_pwm` ≥1（不允许停转） |
-| `[global].fallback_pwm` | **所有**传感器都读不到时的保底转速，必须落在 `min_pwm..=max_pwm` |
-| `[global].shutdown_pwm` | 可选，默认 40；收到 SIGTERM 时写全所有引脚的"安全档" |
-| `[global].command_timeout_seconds` | 可选，默认 5；单次 `ipmitool` 的超时 |
-| `[[zones]].monitor_sources` | 语义传感器名列表；`"GPU"` 是保留名，代表所有 N 卡取最高 |
-| `[[zones]].aggregation` | `max`（默认）或 `mean`，只对**本周期读到值**的源生效 |
-| `[[zones]].target_pins` | 该分区驱动的引脚 |
-| `[[zones]].default_duty_cycle` | 低于第一档阈值时的待机转速 |
-| `[[zones]].debounce_temp` | 单侧防抖，只在**降档**时生效 |
-| `[[zones.thresholds]]` | `temperature` 必须升序，`duty_cycle` 取值 1..=100 |
-| `[[follows]]` | `pin` 的最终 PWM 不得低于 `min_of`，支持链式、拒绝环 |
+| 字段 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `[global].interval_seconds` | 是 | — | 采样周期，≥1 |
+| `[global].min_pwm` | 是 | — | 全局下限，1..=100 且 ≤ `max_pwm`（不允许停转） |
+| `[global].max_pwm` | 是 | — | 全局上限，≤100 |
+| `[global].fallback_pwm` | 是 | — | **所有**传感器都读不到时的保底转速，必须落在 `min_pwm..=max_pwm` |
+| `[global].command_timeout_seconds` | 否 | `5` | 单次 `ipmitool` 的超时，≥1 |
+| `[[zones]]` | 是，≥1 个 | — | 整段缺失在加载期报错 |
+| `[[zones]].name` | 是 | — | 唯一（忽略大小写），仅用于日志 |
+| `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` |
+| `[[zones]].aggregation` | 否 | `max` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
+| `[[zones]].target_pins` | 是 | — | 非空，必须在 `[pins]` 里 |
+| `[[zones]].default_duty_cycle` | 是 | — | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
+| `[[zones]].debounce_temp` | 否 | `2.0` | 单侧防抖（只作用于降档），≥0 且必须小于相邻阈值间隔 |
+| `[[zones]].thresholds` | 是，≥1 条 | — | 缺了在加载期报错 |
+| `[[zones.thresholds]].temperature` | 是 | — | 必须严格升序 |
+| `[[zones.thresholds]].duty_cycle` | 是 | — | 1..=100 |
+| `[[follows]]` | 否 | 无规则 | 整段可以省略；写了才校验 |
+| `[[follows]].pin` | 是 | — | 必须被某个 zone 驱动 |
+| `[[follows]].min_of` | 是 | — | 同上；不能等于 `pin` |
+
+**名字一律大小写不敏感。** `cpu_fan`、`CPU_FAN`、`Cpu_Fan` 是同一个引脚，
+`"gpu"` 与 `"GPU"` 等价。加载时会把 `config.toml` 里的引用统一改写成
+`platform.toml` 声明的大小写，之后再精确比较，所以 `check` 与 `run` 不会出现
+"检查通过、运行找不到"的偏差。`platform.toml` 里只差大小写的两个键（`CPU_FAN`
+与 `cpu_fan` 并存）会直接报错。SDR 名字还额外忽略分隔符：`CPU_Tctl_Value`、
+`CPU Tctl Value`、`cpu-tctl-value` 视为同一个传感器。
 
 校验项（`fanctl check` 与 `run` 启动时都执行，一次列出全部问题）：
 TOML 语法与未知字段 → 阈值升序 → `debounce_temp` 必须小于相邻阈值间隔 →
 引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
-`min_pwm ≤ fallback_pwm ≤ max_pwm`。
+`min_pwm ≤ fallback_pwm ≤ max_pwm` → 名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
 
 > `deny_unknown_fields` 是刻意开的：写错字段名会直接报错，而不是安静地用了默认值。
 
@@ -127,6 +141,9 @@ TOML 语法与未知字段 → 阈值升序 → `debounce_temp` 必须小于相�
 `ipmitool sdr` 每条输出取前两列（名字、读数），`45 degrees C` → `45.0`，
 非温度（`RPM`、`no reading`、`ns`）记为"没有读数"而不是 0 —— 避免把缺数据的源当成低温。
 GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期会自动重试。
+`"GPU"` 只是 `monitor_sources` 里的一个关键字，与主板 SDR 无关：它扫描 NVML 下的
+所有 N 卡取最高，再作为一个源参与本分区的 `max`/`mean`。`[sensors]` 里不允许再定义
+同名键（加载时直接报错），避免一个名字指向两种数据源。
 
 聚合只统计"本周期真有值"的源：`mean` 不会因为没插显卡被拖到 0 ℃。
 
@@ -158,7 +175,7 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 | 一个传感器都读不到 | 全部引脚 → `fallback_pwm` |
 | `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出、不更新"已下发值" |
 | BMC 挂住不回 | 单次调用有超时，控制循环不会被卡死 |
-| SIGINT / SIGTERM | 全部引脚 → `shutdown_pwm`，然后正常退出 |
+| SIGINT / SIGTERM | 每个被驱动的引脚 → 所属分区 `default_duty_cycle`，然后退出 0 |
 
 ---
 
@@ -170,7 +187,9 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
    `check` 只能按名称猜（猜不到会给 `[warn]`，不是错误）。第一次正式跑建议单独盯一次
    `journalctl -u fanctl -f`，确认"改的是哪把扇子"。
 3. `min_pwm ≥ 1` 是硬约束，配置里写 0 会直接报错。
-4. 进程退出时 BMC 保留最后一次写入的值，所以 `shutdown_pwm`（默认 40 %）比"什么都留不下"重要；
+4. 进程退出时 BMC 保留最后一次写入的值，所以 `SIGTERM` 会把每个被驱动的引脚写回
+   所属分区的 `default_duty_cycle`；**没有任何分区驱动的引脚不会被碰**（daemon 从没写过它，
+   退出时也不该凭空塞一个值，`check` 会给出 `[warn]`）。
    `TimeoutStopSec` 必须大于一次 `ipmitool` 超时，否则 systemd 会在优雅退出做到一半时 SIGKILL。
 5. `ipmitool` 需要 root（或 udev 规则 + `CAP_SYS_RAWIO`）；unit 里刻意**没有**加
    `PrivateDevices=yes` 这类会屏蔽 `/dev/ipmi*` 的选项。
@@ -200,7 +219,8 @@ cargo build --release            # 需要 GPU 支持
 cargo build --release --no-default-features   # 无 NVIDIA 驱动的机器
 ```
 
-- Edition 2021，声明 MSRV 1.75（Ubuntu 24.04 自带的 rustc 即可）。`Cargo.lock` 入库，保证部署可复现。
+- Edition 2021，声明 MSRV 1.75（依赖侧声明的 MSRV 都不高于它，对齐 Ubuntu 24.04 自带的 rustc；
+  本地实测构建用的是 1.96）。`Cargo.lock` 入库，保证部署可复现。
 - `#![forbid(unsafe_code)]`；`[lints.clippy] all = "warn"`。
 - 所有需要硬件才能验证的东西都被推到边界：`ipmi::parse_sdr`、`curve`、`merge` 全是纯函数，
   测试不依赖 BMC、不依赖 GPU。

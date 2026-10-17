@@ -30,10 +30,11 @@ PrivateTmp=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 
-# SIGTERM lets fanctl write [global].shutdown_pwm (default 40 %) to every pin
+# SIGTERM lets fanctl write each zone's default_duty_cycle back to its pins
 # before exiting. The BMC keeps the last value written, so stopping the unit
-# never leaves the fans at an extreme setting. TimeoutStopSec must stay larger
-# than one ipmitool timeout, otherwise systemd kills the daemon mid-shutdown.
+# never leaves the fans at the last hot-cycle setting. Pins no zone drives are
+# not touched. TimeoutStopSec must stay larger than one ipmitool timeout,
+# otherwise systemd kills the daemon mid-shutdown.
 KillSignal=SIGTERM
 
 [Install]

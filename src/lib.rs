@@ -23,6 +23,7 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod logging;
+pub mod name;
 pub mod process;
 pub mod sensors;
 

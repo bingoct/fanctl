@@ -9,7 +9,7 @@ pub mod merge;
 
 pub use curve::{band_for_temperature, duty_for_band, next_band, ZoneState};
 pub use engine::Engine;
-pub use merge::TargetMap;
+pub use merge::{standby_targets, TargetMap};
 
 use crate::config::{Aggregation, ZoneConfig};
 use crate::sensors::{SensorSnapshot, Source};

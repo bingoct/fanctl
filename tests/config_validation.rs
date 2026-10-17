@@ -24,7 +24,12 @@ fn fixture(platform: &str, policy: &str) -> (TempDir, PathBuf, PathBuf) {
 
 /// Loads `policy` against the example platform, returning the error text.
 fn load_error(policy: &str) -> String {
-    let (_dir, policy_path, platform_path) = fixture(PLATFORM, policy);
+    load_error_with_platform(PLATFORM, policy)
+}
+
+/// Loads `policy` against a custom platform, returning the error text.
+fn load_error_with_platform(platform: &str, policy: &str) -> String {
+    let (_dir, policy_path, platform_path) = fixture(platform, policy);
     match LoadedConfig::load(&policy_path, &platform_path) {
         Ok(_) => String::new(),
         Err(err) => err.to_string(),
@@ -185,4 +190,86 @@ fn unknown_keys_fail_to_parse() {
     let policy = policy_with(ASCENDING, 2.0).replace("min_pwm = 25", "min_pwm = 25\nmin_pwn = 25");
     let error = load_error(&policy);
     assert!(error.contains("cannot parse"), "unexpected error: {error}");
+}
+
+#[test]
+fn names_are_case_insensitive_and_resolved_to_the_declared_spelling() {
+    let policy = policy_with(ASCENDING, 2.0)
+        .replace(
+            r#"monitor_sources = ["CPU_Tctl"]"#,
+            r#"monitor_sources = ["cpu_tctl"]"#,
+        )
+        .replace(
+            r#"target_pins = ["CPU_FAN"]"#,
+            r#"target_pins = ["cpu_fan"]"#,
+        );
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
+    let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("case must not matter");
+    assert_eq!(loaded.policy.zones[0].monitor_sources[0], "CPU_Tctl");
+    assert_eq!(loaded.policy.zones[0].target_pins[0], "CPU_FAN");
+}
+
+#[test]
+fn follow_rules_are_case_insensitive_too() {
+    let policy = format!(
+        r#"
+[global]
+interval_seconds = 10
+min_pwm = 25
+max_pwm = 100
+fallback_pwm = 60
+
+[[zones]]
+name = "cpu_zone"
+monitor_sources = ["CPU_Tctl"]
+target_pins = ["CPU_FAN"]
+default_duty_cycle = 30
+{ASCENDING}
+
+[[zones]]
+name = "intake_zone"
+monitor_sources = ["CPU_Tctl"]
+target_pins = ["SYS_FAN_1"]
+default_duty_cycle = 30
+{ASCENDING}
+
+[[follows]]
+pin = "sys_fan_1"
+min_of = "cpu_fan"
+"#
+    );
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
+    let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("case must not matter");
+    assert_eq!(loaded.policy.follows[0].pin, "SYS_FAN_1");
+    assert_eq!(loaded.policy.follows[0].min_of, "CPU_FAN");
+}
+
+#[test]
+fn platform_names_that_only_differ_in_case_are_rejected() {
+    let platform = PLATFORM.replace(
+        r#""SYS_FAN_1" = "0x02""#,
+        "\"SYS_FAN_1\" = \"0x02\"\n\"sys_fan_1\" = \"0x04\"",
+    );
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(error.contains("same name"), "unexpected error: {error}");
+}
+
+#[test]
+fn a_board_sensor_called_gpu_is_rejected() {
+    let platform = PLATFORM.replace(
+        r#""SYS_Air_Outlet" = "SYS_Air_Outlet""#,
+        "\"SYS_Air_Outlet\" = \"SYS_Air_Outlet\"\n\"GPU\" = \"GPU_Temp\"",
+    );
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(error.contains("reserved"), "unexpected error: {error}");
+}
+
+#[test]
+fn the_gpu_source_is_case_insensitive() {
+    let policy = policy_with(ASCENDING, 2.0).replace(
+        r#"monitor_sources = ["CPU_Tctl"]"#,
+        r#"monitor_sources = ["CPU_Tctl", "gpu"]"#,
+    );
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
+    LoadedConfig::load(&policy_path, &platform_path).expect("`gpu` must be accepted");
 }

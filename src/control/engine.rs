@@ -11,7 +11,7 @@
 //! | a zone never had a reading | use `global.fallback_pwm` |
 //! | *no* sensor at all | `global.fallback_pwm` on every pin |
 //! | `ipmitool` write fails | log, retry next cycle, never exit |
-//! | SIGINT / SIGTERM | `global.shutdown_pwm` on every pin, then exit 0 |
+//! | SIGINT / SIGTERM | each controlled pin -> its zone's `default_duty_cycle`, then exit 0 |
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,7 @@ use crate::error::Error;
 use crate::sensors::SensorHub;
 
 use super::curve::{duty_for_band, next_band, ZoneState};
-use super::merge::TargetMap;
+use super::merge::{standby_targets, TargetMap};
 
 /// How often the shutdown flag is checked while sleeping.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
@@ -88,15 +88,50 @@ impl Engine {
             }
         }
 
-        info!(
-            duty = self.policy.global.shutdown_pwm,
-            "shutdown requested, restoring safe duty cycle"
-        );
-        self.apply_to_all_pins(self.policy.global.shutdown_pwm);
+        self.restore_standby();
         info!("control loop stopped");
         Ok(())
     }
 
+    /// Restores the standby duty cycle of every controlled pin.
+    ///
+    /// The BMC keeps the last value it was given, so leaving the fans at
+    /// whatever the last hot cycle demanded would leave the machine loud until
+    /// the next boot. `default_duty_cycle` is the right value to fall back to:
+    /// it is the same "room temperature, no load" setting the curve uses.
+    ///
+    /// Pins no zone drives are skipped - the daemon never wrote them, so it has
+    /// nothing to restore and must not invent a value.
+    fn restore_standby(&mut self) {
+        let bounds = &self.policy.global;
+        let standby = standby_targets(&self.policy.zones, bounds.min_pwm, bounds.max_pwm);
+        info!(
+            pins = standby.len(),
+            "shutdown requested, restoring standby duty cycle"
+        );
+
+        for (pin, duty) in standby.iter() {
+            let duty = *duty;
+            match self.actuator.apply(pin, duty) {
+                Ok(()) => {
+                    self.last_sent.insert(pin.clone(), duty);
+                    info!(pin = %pin, duty, "standby duty cycle written");
+                }
+                Err(err) => warn!(
+                    pin = %pin,
+                    duty,
+                    error = %err,
+                    "could not write standby duty cycle"
+                ),
+            }
+        }
+
+        for pin in self.platform.pins.keys() {
+            if standby.get(pin).is_none() {
+                debug!(pin = %pin, "no zone drives this pin, left untouched");
+            }
+        }
+    }
     /// One evaluation cycle. Never returns an error: failures are logged and
     /// retried on the next cycle.
     fn tick(&mut self) {

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
+use crate::name::normalize;
 use crate::sensors::Source;
 
 use super::PlatformConfig;
@@ -38,17 +39,9 @@ pub struct GlobalSettings {
     pub max_pwm: u8,
     /// Duty cycle used when no sensor can be read at all.
     pub fallback_pwm: u8,
-    /// Duty cycle pushed to every pin on shutdown, so the BMC never latches an
-    /// extreme (or zero) value after the daemon exits.
-    #[serde(default = "default_shutdown_pwm")]
-    pub shutdown_pwm: u8,
     /// Deadline for a single `ipmitool` invocation.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_seconds: u64,
-}
-
-fn default_shutdown_pwm() -> u8 {
-    40
 }
 
 fn default_command_timeout() -> u64 {
@@ -124,6 +117,36 @@ pub struct FollowRule {
 }
 
 impl FanConfig {
+    /// Rewrites every reference to the spelling declared in `platform.toml`.
+    ///
+    /// Names are matched case-insensitively, so `cpu_fan` in `config.toml` and
+    /// `CPU_FAN` in `platform.toml` are the same pin. Doing the rewriting once,
+    /// here, means the control and actuator layers can keep comparing exactly
+    /// instead of each re-implementing the rule. Unknown references are left
+    /// untouched for [`FanConfig::validate`] to report.
+    pub fn resolve_names(&mut self, platform: &PlatformConfig) {
+        for zone in &mut self.zones {
+            for source in &mut zone.monitor_sources {
+                if let Some(declared) = platform.find_sensor(source) {
+                    *source = declared.to_string();
+                }
+            }
+            for pin in &mut zone.target_pins {
+                if let Some(declared) = platform.find_pin(pin) {
+                    *pin = declared.to_string();
+                }
+            }
+        }
+        for rule in &mut self.follows {
+            if let Some(declared) = platform.find_pin(&rule.pin) {
+                rule.pin = declared.to_string();
+            }
+            if let Some(declared) = platform.find_pin(&rule.min_of) {
+                rule.min_of = declared.to_string();
+            }
+        }
+    }
+
     /// Returns every problem found in the file; an empty vector means "valid".
     ///
     /// Validation is exhaustive instead of fail-fast so that `fanctl check`
@@ -162,9 +185,6 @@ impl FanConfig {
                 global.fallback_pwm, global.min_pwm, global.max_pwm
             ));
         }
-        if global.shutdown_pwm > 100 {
-            problems.push("[global].shutdown_pwm must be within 0..=100".to_string());
-        }
     }
 
     fn validate_zones(&self, platform: &PlatformConfig, problems: &mut Vec<String>) {
@@ -177,7 +197,7 @@ impl FanConfig {
             let label = format!("zone `{}`", zone.name);
             if zone.name.trim().is_empty() {
                 problems.push("a zone has an empty name".to_string());
-            } else if !seen_names.insert(zone.name.as_str()) {
+            } else if !seen_names.insert(normalize(&zone.name)) {
                 problems.push(format!("duplicate zone name `{}`", zone.name));
             }
 

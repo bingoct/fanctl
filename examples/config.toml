@@ -1,15 +1,19 @@
 # fanctl - business logic: zones, curves, coupling
 #
-# Semantics only. Pin names and sensor names are resolved through platform.toml.
-# Documented in README.md; validate with `fanctl check`.
+# Semantics only. Pin names and sensor names are resolved through platform.toml;
+# they are matched case-insensitively. Documented in README.md; validate with
+# `fanctl check`.
 
 [global]
 interval_seconds = 10        # sampling period (seconds)
 min_pwm = 25                 # hard floor, fans never stop
 max_pwm = 100                # hard ceiling
 fallback_pwm = 60            # used when no sensor can be read at all
-# shutdown_pwm = 40          # pushed to every pin on SIGINT/SIGTERM (default 40)
 # command_timeout_seconds = 5  # deadline for one ipmitool invocation (default 5)
+#
+# On SIGINT/SIGTERM each pin is set back to the default_duty_cycle of the zone
+# that drives it, so the BMC does not keep the last (possibly 100 %) value.
+# Pins no zone drives are left untouched.
 
 # --- coupling: case fans must never be slower than the CPU fan --------------
 [[follows]]

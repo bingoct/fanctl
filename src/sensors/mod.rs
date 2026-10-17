@@ -11,12 +11,12 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::config::PlatformConfig;
+use crate::name::{is_gpu_source, sdr_key};
+
+pub use crate::name::GPU_SOURCE;
 
 pub mod gpu;
 pub mod ipmi;
-
-/// The one reserved source name that is not an IPMI sensor.
-pub const GPU_SOURCE: &str = "GPU";
 
 /// A single temperature source referenced from `monitor_sources`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,14 +30,15 @@ pub enum Source {
 impl Source {
     /// Parses a `monitor_sources` entry.
     ///
-    /// `"GPU"` (case insensitive) is reserved; everything else is looked up in
-    /// `platform.toml` `[sensors]`.
+    /// `"GPU"` (any spelling) is reserved; everything else is a semantic name
+    /// from `platform.toml` `[sensors]`, already folded to its declared
+    /// spelling by [`crate::config::FanConfig::resolve_names`].
     pub fn parse(raw: &str) -> Result<Self, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err("monitor source name must not be empty".to_string());
         }
-        if trimmed.eq_ignore_ascii_case(GPU_SOURCE) {
+        if is_gpu_source(trimmed) {
             return Ok(Source::Gpu);
         }
         Ok(Source::Ipmi(trimmed.to_string()))
@@ -99,7 +100,7 @@ impl SensorHub {
         let sdr_to_semantic = platform
             .sensors
             .iter()
-            .map(|(semantic, sdr)| (sdr.trim().to_ascii_lowercase(), semantic.clone()))
+            .map(|(semantic, sdr)| (sdr_key(sdr), semantic.clone()))
             .collect();
         let semantic_to_sdr = platform
             .sensors
@@ -125,7 +126,7 @@ impl SensorHub {
         match ipmi::read_sdr(&self.ipmitool, timeout) {
             Ok(entries) => {
                 for entry in entries {
-                    let key = entry.name.trim().to_ascii_lowercase();
+                    let key = sdr_key(&entry.name);
                     if let Some(semantic) = self.sdr_to_semantic.get(&key) {
                         if let Some(celsius) = entry.celsius {
                             snapshot.ipmi.insert(semantic.clone(), celsius);

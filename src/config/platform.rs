@@ -4,10 +4,12 @@
 //! semantic names to the raw addresses `ipmitool` expects, which is what keeps
 //! the control code free of board specific constants.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::Deserialize;
+
+use crate::name::{normalize, GPU_SOURCE};
 
 /// Contents of `platform.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -84,12 +86,63 @@ impl PlatformConfig {
             }
         }
 
+        // Names are compared case-insensitively everywhere, so two keys that
+        // only differ in case would make one of them unreachable.
+        check_unique_names("[pins]", self.pins.keys(), &mut problems);
+        check_unique_names("[sensors]", self.sensors.keys(), &mut problems);
+
+        // "GPU" is taken by the NVML provider; a sensor of that name would be
+        // shadowed in every `monitor_sources` entry, with no diagnostic.
+        if self.find_sensor(GPU_SOURCE).is_some() {
+            problems.push(format!(
+                "[sensors] must not define `{GPU_SOURCE}`: the name is reserved for the NVIDIA \
+                 readings and would shadow the SDR sensor"
+            ));
+        }
+
         problems
+    }
+
+    /// Key of `pin` as declared in `[pins]`, matched case-insensitively.
+    ///
+    /// Returning the declared spelling lets the policy layer rewrite its own
+    /// references to it, so the rest of the program can compare exactly.
+    pub fn find_pin(&self, pin: &str) -> Option<&str> {
+        find_key(&self.pins, pin)
+    }
+
+    /// Key of `semantic` as declared in `[sensors]`, matched case-insensitively.
+    pub fn find_sensor(&self, semantic: &str) -> Option<&str> {
+        find_key(&self.sensors, semantic)
     }
 
     /// Hexadecimal id configured for `pin`, `None` for an unknown pin.
     pub fn pin_id(&self, pin: &str) -> Option<&str> {
         self.pins.get(pin).map(String::as_str)
+    }
+}
+
+/// Declared key matching `wanted` case-insensitively.
+fn find_key<'a, V>(map: &'a BTreeMap<String, V>, wanted: &str) -> Option<&'a str> {
+    let wanted = normalize(wanted);
+    map.keys()
+        .map(String::as_str)
+        .find(|name| normalize(name) == wanted)
+}
+
+/// Reports keys that collapse to the same name once case is ignored.
+fn check_unique_names<'a>(
+    section: &str,
+    names: impl Iterator<Item = &'a String>,
+    problems: &mut Vec<String>,
+) {
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for name in names {
+        if let Some(first) = seen.insert(normalize(name), name.as_str()) {
+            problems.push(format!(
+                "{section}: `{first}` and `{name}` are the same name (case is ignored)"
+            ));
+        }
     }
 }
 

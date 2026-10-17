@@ -1,6 +1,6 @@
 //! Subcommand orchestration: `fanctl check` and `fanctl run`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +10,9 @@ use tracing::info;
 
 use crate::cli::{Cli, Command};
 use crate::config::LoadedConfig;
-use crate::control::Engine;
+use crate::control::{standby_targets, Engine};
 use crate::error::Error;
+use crate::name::sdr_key;
 use crate::sensors::{gpu, ipmi};
 
 /// Entry point used by `main`.
@@ -55,12 +56,8 @@ fn check(cli: &Cli) -> Result<(), Error> {
         loaded.policy.follows.len()
     );
     println!(
-        "[ ok ] interval {}s, pwm {}..={}, fallback {}, shutdown {}",
-        global.interval_seconds,
-        global.min_pwm,
-        global.max_pwm,
-        global.fallback_pwm,
-        global.shutdown_pwm
+        "[ ok ] interval {}s, pwm {}..={}, fallback {}",
+        global.interval_seconds, global.min_pwm, global.max_pwm, global.fallback_pwm
     );
 
     for zone in &loaded.policy.zones {
@@ -76,6 +73,14 @@ fn check(cli: &Cli) -> Result<(), Error> {
         );
     }
 
+    let standby = standby_targets(&loaded.policy.zones, global.min_pwm, global.max_pwm);
+    let plan = standby
+        .iter()
+        .map(|(pin, duty)| format!("{pin} {duty}%"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("[ ok ] shutdown restores: {plan}");
+
     let timeout = Duration::from_secs(global.command_timeout_seconds.max(1));
     let entries = match ipmi::read_sdr(&platform.info.ipmitool_path, timeout) {
         Ok(entries) => entries,
@@ -88,12 +93,12 @@ fn check(cli: &Cli) -> Result<(), Error> {
 
     let index: HashMap<String, Option<f64>> = entries
         .iter()
-        .map(|entry| (normalize(&entry.name), entry.celsius))
+        .map(|entry| (sdr_key(&entry.name), entry.celsius))
         .collect();
 
     let mut missing = 0_usize;
     for (semantic, sdr_name) in &platform.sensors {
-        match index.get(&normalize(sdr_name)) {
+        match index.get(&sdr_key(sdr_name)) {
             Some(Some(celsius)) => {
                 println!("[ ok ] sensor `{semantic}` <- `{sdr_name}` = {celsius} C");
             }
@@ -108,6 +113,12 @@ fn check(cli: &Cli) -> Result<(), Error> {
         }
     }
 
+    let driven: HashSet<&str> = loaded
+        .policy
+        .zones
+        .iter()
+        .flat_map(|zone| zone.target_pins.iter().map(String::as_str))
+        .collect();
     for (pin, id) in &platform.pins {
         match find_fan_sensor(&index, pin) {
             Some(name) => println!("[ ok ] pin `{pin}` ({id}) <- fan sensor `{name}`"),
@@ -115,6 +126,11 @@ fn check(cli: &Cli) -> Result<(), Error> {
                 "[warn] pin `{pin}` ({id}): no fan sensor with a matching name; the id was only \
                  syntax-checked, not verified on hardware"
             ),
+        }
+        if !driven.contains(pin.as_str()) {
+            println!(
+                "[warn] pin `{pin}` ({id}) is not driven by any zone: never set, never restored"
+            );
         }
     }
 
@@ -162,22 +178,12 @@ fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
     Engine::new(loaded, dry_run, shutdown).run()
 }
 
-/// Lowercases a name and drops everything that is not alphanumeric, so that
-/// `CPU_Tctl_Value` and `CPU Tctl Value` are treated as the same sensor.
-fn normalize(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
 /// Best effort: finds a fan sensor whose name contains the pin name.
 ///
 /// A pin id can only be verified for real by writing to it, which `check` must
 /// not do, so this only warns.
 fn find_fan_sensor(index: &HashMap<String, Option<f64>>, pin: &str) -> Option<String> {
-    let wanted = normalize(pin);
+    let wanted = sdr_key(pin);
     index
         .keys()
         .find(|name| name.as_str().contains(wanted.as_str()))
