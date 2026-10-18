@@ -13,19 +13,26 @@
 //!
 //! Everything the daemon needs is decided in [`control`]; [`actuator`] only
 //! executes. That split is what makes the core testable without any hardware.
+//!
+//! Each module is `foo.rs` next to `foo/`, the layout `cargo new` produces and
+//! the one the 2018 edition made possible; `mod.rs` is not used anywhere.
+//!
+//! Four files sit at the root because they are spoken by every layer or by
+//! `main` directly: [`error`] (the shared vocabulary), [`actuator`] (the only
+//! writer of the BMC), [`logging`] (process-wide subscriber setup) and the
+//! usual `main` / `lib` pair. Everything else lives in one of five directories
+//! grouped by concern: [`app`], [`config`], [`sensors`], [`control`], [`util`].
 
 #![forbid(unsafe_code)]
 
 pub mod actuator;
 pub mod app;
-pub mod cli;
 pub mod config;
 pub mod control;
 pub mod error;
 pub mod logging;
-pub mod name;
-pub mod process;
 pub mod sensors;
+pub mod util;
 
 pub use error::Error;
 

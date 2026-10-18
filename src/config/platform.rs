@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::name::{normalize, GPU_SOURCE};
+use crate::util::name::{normalize, GPU_SOURCE};
 
 /// Contents of `platform.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -33,12 +33,8 @@ pub struct PlatformInfo {
     /// `ipmitool` argument template containing `{id}` and `{pwm}`.
     pub cmd_template: String,
     /// Path to the `ipmitool` executable.
-    #[serde(default = "default_ipmitool_path")]
+    #[serde(default = "super::defaults::ipmitool_path")]
     pub ipmitool_path: PathBuf,
-}
-
-fn default_ipmitool_path() -> PathBuf {
-    PathBuf::from("ipmitool")
 }
 
 impl PlatformConfig {

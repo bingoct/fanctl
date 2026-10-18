@@ -8,71 +8,107 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
-use crate::name::normalize;
 use crate::sensors::Source;
+use crate::util::name::normalize;
 
 use super::PlatformConfig;
 
-/// Contents of `config.toml`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Contents of `config.toml`, with every zone fully resolved.
+#[derive(Debug, Clone)]
 pub struct FanConfig {
-    /// Global limits and timings.
+    /// Global limits, timings and inherited defaults.
     pub global: GlobalSettings,
     /// Fan zones; every zone owns one curve and one or more pins.
-    #[serde(default)]
     pub zones: Vec<ZoneConfig>,
     /// Cross-zone coupling rules ("pin A must never be slower than pin B").
-    #[serde(default)]
     pub follows: Vec<FollowRule>,
 }
 
-/// Daemon wide settings.
+/// Daemon wide settings, and the defaults every zone inherits.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalSettings {
     /// Seconds between two evaluation cycles.
     pub interval_seconds: u64,
     /// Hard floor applied to every pin; keeps fans spinning.
-    pub min_pwm: u8,
+    pub min_duty_cycle: u8,
     /// Hard ceiling applied to every pin.
-    pub max_pwm: u8,
+    pub max_duty_cycle: u8,
     /// Duty cycle used when no sensor can be read at all.
-    pub fallback_pwm: u8,
+    pub fallback_duty_cycle: u8,
     /// Deadline for a single `ipmitool` invocation.
-    #[serde(default = "default_command_timeout")]
+    #[serde(default = "super::defaults::command_timeout_seconds")]
     pub command_timeout_seconds: u64,
+    /// Standby duty cycle inherited by zones that do not set their own.
+    pub default_duty_cycle: u8,
+    /// Hysteresis in degrees Celsius inherited by zones that do not set their own.
+    #[serde(default = "super::defaults::debounce_celsius")]
+    pub debounce_celsius: f64,
+    /// Aggregation inherited by zones that do not set their own.
+    #[serde(default)]
+    pub aggregation: Aggregation,
 }
 
-fn default_command_timeout() -> u64 {
-    5
-}
-
-/// One independently regulated group of fans.
+/// `config.toml` exactly as written.
+///
+/// A zone may leave `aggregation`, `default_duty_cycle` and `debounce_celsius`
+/// out and inherit them from `[global]`; [`FanConfig::from_raw`] folds the
+/// inheritance in once, so the rest of the crate only ever sees concrete
+/// values and never has to decide what "unset" means.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ZoneConfig {
+pub struct RawFanConfig {
+    /// Daemon wide settings and inherited defaults.
+    pub global: GlobalSettings,
+    /// Fan zones, before inheritance.
+    #[serde(default)]
+    pub zones: Vec<RawZone>,
+    /// Cross-zone coupling rules.
+    #[serde(default)]
+    pub follows: Vec<FollowRule>,
+}
+
+/// One zone as written; `None` means "inherit from `[global]`".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawZone {
     /// Unique name, used in logs.
     pub name: String,
     /// Semantic sensor names; `"GPU"` is reserved for the NVIDIA readings.
     pub monitor_sources: Vec<String>,
     /// How the source temperatures are combined.
     #[serde(default)]
+    pub aggregation: Option<Aggregation>,
+    /// Pins driven by this zone.
+    pub target_pins: Vec<String>,
+    /// Duty cycle while the temperature stays below the first threshold.
+    #[serde(default)]
+    pub default_duty_cycle: Option<u8>,
+    /// Single sided hysteresis in degrees Celsius, applied on the way *down*.
+    #[serde(default)]
+    pub debounce_celsius: Option<f64>,
+    /// Curve breakpoints, must be sorted by ascending temperature.
+    #[serde(default)]
+    pub thresholds: Vec<Threshold>,
+}
+
+/// One independently regulated group of fans, with defaults already folded in.
+#[derive(Debug, Clone)]
+pub struct ZoneConfig {
+    /// Unique name, used in logs.
+    pub name: String,
+    /// Semantic sensor names; `"GPU"` is reserved for the NVIDIA readings.
+    pub monitor_sources: Vec<String>,
+    /// How the source temperatures are combined.
     pub aggregation: Aggregation,
     /// Pins driven by this zone.
     pub target_pins: Vec<String>,
     /// Duty cycle while the temperature stays below the first threshold.
     pub default_duty_cycle: u8,
     /// Single sided hysteresis in degrees Celsius, applied on the way *down*.
-    #[serde(default = "default_debounce")]
-    pub debounce_temp: f64,
+    pub debounce_celsius: f64,
     /// Curve breakpoints, must be sorted by ascending temperature.
-    #[serde(default)]
     pub thresholds: Vec<Threshold>,
-}
-
-fn default_debounce() -> f64 {
-    2.0
 }
 
 /// A single curve breakpoint.
@@ -117,6 +153,34 @@ pub struct FollowRule {
 }
 
 impl FanConfig {
+    /// Folds `[global]` defaults into every zone that left them out.
+    pub fn from_raw(raw: RawFanConfig) -> Self {
+        let RawFanConfig {
+            global,
+            zones,
+            follows,
+        } = raw;
+
+        let zones = zones
+            .into_iter()
+            .map(|zone| ZoneConfig {
+                name: zone.name,
+                monitor_sources: zone.monitor_sources,
+                aggregation: zone.aggregation.unwrap_or(global.aggregation),
+                target_pins: zone.target_pins,
+                default_duty_cycle: zone.default_duty_cycle.unwrap_or(global.default_duty_cycle),
+                debounce_celsius: zone.debounce_celsius.unwrap_or(global.debounce_celsius),
+                thresholds: zone.thresholds,
+            })
+            .collect();
+
+        Self {
+            global,
+            zones,
+            follows,
+        }
+    }
+
     /// Rewrites every reference to the spelling declared in `platform.toml`.
     ///
     /// Names are matched case-insensitively, so `cpu_fan` in `config.toml` and
@@ -167,23 +231,44 @@ impl FanConfig {
         if global.command_timeout_seconds == 0 {
             problems.push("[global].command_timeout_seconds must be at least 1".to_string());
         }
-        if global.min_pwm == 0 {
-            problems.push("[global].min_pwm must be at least 1 (fans must never stop)".to_string());
+        if global.min_duty_cycle == 0 {
+            problems.push(
+                "[global].min_duty_cycle must be at least 1 (fans must never stop)".to_string(),
+            );
         }
-        if global.max_pwm > 100 || global.min_pwm > 100 || global.fallback_pwm > 100 {
+        if global.max_duty_cycle > 100
+            || global.min_duty_cycle > 100
+            || global.fallback_duty_cycle > 100
+        {
             problems.push("pwm values must stay within 0..=100".to_string());
         }
-        if global.min_pwm > global.max_pwm {
+        if global.min_duty_cycle > global.max_duty_cycle {
             problems.push(format!(
-                "[global].min_pwm ({}) must not exceed max_pwm ({})",
-                global.min_pwm, global.max_pwm
+                "[global].min_duty_cycle ({}) must not exceed max_duty_cycle ({})",
+                global.min_duty_cycle, global.max_duty_cycle
             ));
         }
-        if global.fallback_pwm < global.min_pwm || global.fallback_pwm > global.max_pwm {
+        if global.fallback_duty_cycle < global.min_duty_cycle
+            || global.fallback_duty_cycle > global.max_duty_cycle
+        {
             problems.push(format!(
-                "[global].fallback_pwm ({}) must be within min_pwm..=max_pwm ({}..={})",
-                global.fallback_pwm, global.min_pwm, global.max_pwm
+                "[global].fallback_duty_cycle ({}) must be within min_duty_cycle..=max_duty_cycle ({}..={})",
+                global.fallback_duty_cycle, global.min_duty_cycle, global.max_duty_cycle
             ));
+        }
+        if global.default_duty_cycle == 0 || global.default_duty_cycle > 100 {
+            problems.push("[global].default_duty_cycle must be within 1..=100".to_string());
+        } else if global.default_duty_cycle < global.min_duty_cycle
+            || global.default_duty_cycle > global.max_duty_cycle
+        {
+            problems.push(format!(
+                "[global].default_duty_cycle ({}) must be within min_duty_cycle..=max_duty_cycle \
+                 ({}..={})",
+                global.default_duty_cycle, global.min_duty_cycle, global.max_duty_cycle
+            ));
+        }
+        if !global.debounce_celsius.is_finite() || global.debounce_celsius < 0.0 {
+            problems.push("[global].debounce_celsius must be a finite number >= 0".to_string());
         }
     }
 
@@ -235,16 +320,28 @@ impl FanConfig {
                     zone.default_duty_cycle
                 ));
             }
-            if zone.debounce_temp < 0.0 {
+            if zone.debounce_celsius < 0.0 {
                 problems.push(format!(
-                    "{label}: debounce_temp ({}) must not be negative",
-                    zone.debounce_temp
+                    "{label}: debounce_celsius ({}) must not be negative",
+                    zone.debounce_celsius
                 ));
             }
             if zone.thresholds.is_empty() {
                 problems.push(format!(
                     "{label}: at least one [[zones.thresholds]] entry is required"
                 ));
+            }
+            // The standby step sits below the first threshold, so it must also
+            // be the slowest one: otherwise crossing that threshold would make
+            // the fans *quieter* exactly when the machine gets hotter.
+            if let Some(first) = zone.thresholds.first() {
+                if zone.default_duty_cycle > first.duty_cycle {
+                    problems.push(format!(
+                        "{label}: default_duty_cycle ({}) must not exceed the duty_cycle of the \
+                         first threshold ({}) - the curve would slow the fans down as it heats up",
+                        zone.default_duty_cycle, first.duty_cycle
+                    ));
+                }
             }
 
             let mut previous: Option<f64> = None;
@@ -264,11 +361,11 @@ impl FanConfig {
                         ));
                     } else {
                         let gap = threshold.temperature - previous_temp;
-                        if zone.debounce_temp >= gap {
+                        if zone.debounce_celsius >= gap {
                             problems.push(format!(
-                                "{label}: debounce_temp ({}) must be smaller than the gap between \
+                                "{label}: debounce_celsius ({}) must be smaller than the gap between \
                                  {} C and {} C ({}) - otherwise the step can never be left",
-                                zone.debounce_temp, previous_temp, threshold.temperature, gap
+                                zone.debounce_celsius, previous_temp, threshold.temperature, gap
                             ));
                         }
                     }

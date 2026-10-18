@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use fanctl::config::LoadedConfig;
+use fanctl::config::{Aggregation, LoadedConfig};
 use tempfile::TempDir;
 
 const PLATFORM: &str = include_str!("../examples/platform.toml");
@@ -41,16 +41,17 @@ fn policy_with(thresholds: &str, debounce: f64) -> String {
         r#"
 [global]
 interval_seconds = 10
-min_pwm = 25
-max_pwm = 100
-fallback_pwm = 60
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 30
 
 [[zones]]
 name = "cpu_zone"
 monitor_sources = ["CPU_Tctl"]
 target_pins = ["CPU_FAN"]
 default_duty_cycle = 30
-debounce_temp = {debounce}
+debounce_celsius = {debounce}
 {thresholds}
 "#
     )
@@ -103,7 +104,10 @@ temperature = 56
 duty_cycle = 60
 "#;
     let error = load_error(&policy_with(tight, 2.0));
-    assert!(error.contains("debounce_temp"), "unexpected error: {error}");
+    assert!(
+        error.contains("debounce_celsius"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -138,9 +142,10 @@ fn follow_cycle_is_rejected() {
         r#"
 [global]
 interval_seconds = 10
-min_pwm = 25
-max_pwm = 100
-fallback_pwm = 60
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 30
 
 [[zones]]
 name = "cpu_zone"
@@ -172,10 +177,13 @@ min_of = "SYS_FAN_1"
 #[test]
 fn inverted_pwm_window_is_rejected() {
     let policy = policy_with(ASCENDING, 2.0)
-        .replace("min_pwm = 25", "min_pwm = 100")
-        .replace("max_pwm = 100", "max_pwm = 50");
+        .replace("min_duty_cycle = 25", "min_duty_cycle = 100")
+        .replace("max_duty_cycle = 100", "max_duty_cycle = 50");
     let error = load_error(&policy);
-    assert!(error.contains("min_pwm"), "unexpected error: {error}");
+    assert!(
+        error.contains("min_duty_cycle"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -187,7 +195,8 @@ fn missing_required_field_fails_to_parse() {
 
 #[test]
 fn unknown_keys_fail_to_parse() {
-    let policy = policy_with(ASCENDING, 2.0).replace("min_pwm = 25", "min_pwm = 25\nmin_pwn = 25");
+    let policy = policy_with(ASCENDING, 2.0)
+        .replace("min_duty_cycle = 25", "min_duty_cycle = 25\nmin_pwn = 25");
     let error = load_error(&policy);
     assert!(error.contains("cannot parse"), "unexpected error: {error}");
 }
@@ -215,9 +224,10 @@ fn follow_rules_are_case_insensitive_too() {
         r#"
 [global]
 interval_seconds = 10
-min_pwm = 25
-max_pwm = 100
-fallback_pwm = 60
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 30
 
 [[zones]]
 name = "cpu_zone"
@@ -272,4 +282,95 @@ fn the_gpu_source_is_case_insensitive() {
     );
     let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
     LoadedConfig::load(&policy_path, &platform_path).expect("`gpu` must be accepted");
+}
+
+#[test]
+fn a_zone_inherits_the_global_policy() {
+    let policy = r#"
+[global]
+interval_seconds = 10
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 35
+debounce_celsius = 3
+aggregation = "mean"
+
+[[zones]]
+name = "cpu_zone"
+monitor_sources = ["CPU_Tctl"]
+target_pins = ["CPU_FAN"]
+
+[[zones.thresholds]]
+temperature = 55
+duty_cycle = 40
+
+[[zones.thresholds]]
+temperature = 70
+duty_cycle = 60
+"#;
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, policy);
+    let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("valid");
+    let zone = &loaded.policy.zones[0];
+    assert_eq!(zone.default_duty_cycle, 35);
+    assert_eq!(zone.debounce_celsius, 3.0);
+    assert_eq!(zone.aggregation, Aggregation::Mean);
+}
+
+#[test]
+fn a_zone_can_override_the_global_policy() {
+    let policy = r#"
+[global]
+interval_seconds = 10
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 30
+debounce_celsius = 2
+aggregation = "max"
+
+[[zones]]
+name = "cpu_zone"
+monitor_sources = ["CPU_Tctl"]
+target_pins = ["CPU_FAN"]
+default_duty_cycle = 35
+debounce_celsius = 4
+aggregation = "mean"
+
+[[zones.thresholds]]
+temperature = 55
+duty_cycle = 40
+
+[[zones.thresholds]]
+temperature = 70
+duty_cycle = 60
+"#;
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, policy);
+    let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("valid");
+    let zone = &loaded.policy.zones[0];
+    assert_eq!(zone.default_duty_cycle, 35);
+    assert_eq!(zone.debounce_celsius, 4.0);
+    assert_eq!(zone.aggregation, Aggregation::Mean);
+}
+
+#[test]
+fn a_standby_step_above_the_first_threshold_is_rejected() {
+    // 50 % below 55 C, then 40 % at 55 C: hotter would mean quieter.
+    let policy =
+        policy_with(ASCENDING, 2.0).replace("default_duty_cycle = 30", "default_duty_cycle = 50");
+    let error = load_error(&policy);
+    assert!(
+        error.contains("must not exceed"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_global_standby_step_outside_the_window_is_rejected() {
+    let policy = policy_with(ASCENDING, 2.0).replace("min_duty_cycle = 25", "min_duty_cycle = 40");
+    let error = load_error(&policy);
+    assert!(
+        error.contains("default_duty_cycle (30)"),
+        "unexpected error: {error}"
+    );
 }

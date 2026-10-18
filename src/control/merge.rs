@@ -7,7 +7,7 @@
 //! 2. **Follow**: `pin` is raised to at least `min_of` (fixed point until the
 //!    map stops changing, so chains like `SYS_FAN_2 -> SYS_FAN_1 -> CPU_FAN`
 //!    resolve regardless of declaration order).
-//! 3. **Limits**: every value is clamped into `[min_pwm, max_pwm]`.
+//! 3. **Limits**: every value is clamped into `[min_duty_cycle, max_duty_cycle]`.
 
 use std::collections::BTreeMap;
 
@@ -25,11 +25,11 @@ impl TargetMap {
         Self::default()
     }
 
-    /// Requests `duty` for `pin`, keeping the higher value on conflict.
-    pub fn raise(&mut self, pin: &str, duty: u8) {
-        let entry = self.duties.entry(pin.to_string()).or_insert(duty);
-        if *entry < duty {
-            *entry = duty;
+    /// Requests `duty_cycle` for `pin`, keeping the higher value on conflict.
+    pub fn raise(&mut self, pin: &str, duty_cycle: u8) {
+        let entry = self.duties.entry(pin.to_string()).or_insert(duty_cycle);
+        if *entry < duty_cycle {
+            *entry = duty_cycle;
         }
     }
 
@@ -48,7 +48,7 @@ impl TargetMap {
         self.duties.is_empty()
     }
 
-    /// Pin -> duty pairs, sorted by pin name.
+    /// Pin -> duty_cycle pairs, sorted by pin name.
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, u8> {
         self.duties.iter()
     }
@@ -85,8 +85,8 @@ impl TargetMap {
     /// Clamps every duty cycle into `min..=max` (the bounds are ordered first).
     pub fn clamp(&mut self, min: u8, max: u8) {
         let (lower, upper) = if min <= max { (min, max) } else { (max, min) };
-        for duty in self.duties.values_mut() {
-            *duty = (*duty).clamp(lower, upper);
+        for duty_cycle in self.duties.values_mut() {
+            *duty_cycle = (*duty_cycle).clamp(lower, upper);
         }
     }
 }
@@ -128,7 +128,7 @@ mod tests {
             aggregation: Aggregation::Max,
             target_pins: vec![pin.to_string()],
             default_duty_cycle,
-            debounce_temp: 2.0,
+            debounce_celsius: 2.0,
             thresholds: Vec::new(),
         }
     }
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_rules_never_lower_a_duty_cycle() {
+    fn follow_rules_never_lower_a_duty() {
         let mut map = TargetMap::new();
         map.raise("CPU_FAN", 80);
         map.raise("SYS_FAN_1", 30);

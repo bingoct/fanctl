@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use crate::config::PlatformConfig;
 use crate::error::Error;
-use crate::process::output_with_timeout;
+use crate::util::process::run_checked;
 
 /// Writes PWM duty cycles to the board.
 pub struct PwmActuator {
@@ -46,11 +46,10 @@ impl PwmActuator {
     /// Returns an error on any failure; the caller logs it and retries on the
     /// next cycle, which is the desired behaviour for a rebooting BMC.
     pub fn apply(&self, pin: &str, duty: u8) -> Result<(), Error> {
-        let id = self.pins.get(pin).ok_or_else(|| {
-            Error::Validation(format!(
-                "pin `{pin}` is not defined in platform.toml [pins]"
-            ))
-        })?;
+        let id = self
+            .pins
+            .get(pin)
+            .ok_or_else(|| Error::UnknownPin(pin.to_string()))?;
 
         let rendered = self
             .template
@@ -67,24 +66,50 @@ impl PwmActuator {
         let mut command = Command::new(&self.ipmitool);
         command.args(rendered.split_whitespace());
 
-        let output = output_with_timeout(command, self.timeout).map_err(|source| {
-            Error::Ipmi(format!(
-                "could not run `{}`: {source}",
-                self.ipmitool.display()
-            ))
-        })?;
+        run_checked(command, self.timeout)?;
+        Ok(())
+    }
+}
 
-        if output.status.success() {
-            return Ok(());
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::PwmActuator;
+    use crate::config::PlatformConfig;
+    use crate::error::Error;
+
+    fn platform() -> PlatformConfig {
+        toml::from_str(
+            r#"
+[platform]
+name = "Test"
+cmd_template = "raw 0x2e {id} {pwm}"
+
+[pins]
+"CPU_FAN" = "0x00"
+
+[sensors]
+"CPU_Tctl" = "CPU_Tctl_Value"
+"#,
+        )
+        .expect("test platform must parse")
+    }
+
+    #[test]
+    fn unknown_pin_has_its_own_error() {
+        let actuator = PwmActuator::new(&platform(), true, Duration::from_secs(1));
+        match actuator.apply("SYS_FAN_9", 40) {
+            Err(Error::UnknownPin(pin)) => assert_eq!(pin, "SYS_FAN_9"),
+            other => panic!("expected UnknownPin, got {other:?}"),
         }
+    }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(Error::Ipmi(format!(
-            "`ipmitool {rendered}` failed with {}: {} {}",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        )))
+    #[test]
+    fn dry_run_never_runs_the_command() {
+        let actuator = PwmActuator::new(&platform(), true, Duration::from_secs(1));
+        actuator
+            .apply("CPU_FAN", 40)
+            .expect("dry run must succeed even without ipmitool");
     }
 }

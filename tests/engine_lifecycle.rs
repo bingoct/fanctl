@@ -30,16 +30,17 @@ ipmitool_path = "/nonexistent/ipmitool"
 const POLICY: &str = r#"
 [global]
 interval_seconds = 1
-min_pwm = 25
-max_pwm = 100
-fallback_pwm = 60
+min_duty_cycle = 25
+max_duty_cycle = 100
+fallback_duty_cycle = 60
+default_duty_cycle = 30
 
 [[zones]]
 name = "cpu_zone"
 monitor_sources = ["CPU_Tctl"]
 target_pins = ["CPU_FAN"]
 default_duty_cycle = 30
-debounce_temp = 2
+debounce_celsius = 2
 
 [[zones.thresholds]]
 temperature = 55

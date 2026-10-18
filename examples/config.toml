@@ -6,14 +6,20 @@
 
 [global]
 interval_seconds = 10        # sampling period (seconds)
-min_pwm = 25                 # hard floor, fans never stop
-max_pwm = 100                # hard ceiling
-fallback_pwm = 60            # used when no sensor can be read at all
+min_duty_cycle = 25          # hard floor, fans never stop
+max_duty_cycle = 100         # hard ceiling
+fallback_duty_cycle = 60     # used when no sensor can be read at all
+
+# The three keys below are the shared policy: a zone that omits any of them
+# inherits the value written here. Repeat a key inside a zone to override it.
+default_duty_cycle = 30      # standby, below the first threshold
+debounce_celsius = 2         # hysteresis applied only when dropping a step
+aggregation = "max"          # max or mean
 # command_timeout_seconds = 5  # deadline for one ipmitool invocation (default 5)
-#
-# On SIGINT/SIGTERM each pin is set back to the default_duty_cycle of the zone
-# that drives it, so the BMC does not keep the last (possibly 100 %) value.
-# Pins no zone drives are left untouched.
+
+# On SIGINT/SIGTERM each pin is set back to its zone's default_duty_cycle, so
+# the BMC does not keep the last (possibly 100 %) value. Pins no zone drives
+# are left untouched.
 
 # --- coupling: case fans must never be slower than the CPU fan --------------
 [[follows]]
@@ -28,10 +34,7 @@ min_of = "CPU_FAN"
 [[zones]]
 name = "cpu_zone"
 monitor_sources = ["CPU_Tctl"]
-aggregation = "max"
 target_pins = ["CPU_FAN"]
-default_duty_cycle = 30      # standby, below the first threshold
-debounce_temp = 2            # hysteresis applied only when dropping a step
 
 [[zones.thresholds]]
 temperature = 55
@@ -49,10 +52,7 @@ duty_cycle = 100
 [[zones]]
 name = "intake_zone"
 monitor_sources = ["CPU_Tctl", "GPU"]   # highest of CPU and all GPUs
-aggregation = "max"
 target_pins = ["SYS_FAN_1"]
-default_duty_cycle = 30
-debounce_temp = 2
 
 [[zones.thresholds]]
 temperature = 60
@@ -66,10 +66,7 @@ duty_cycle = 65
 [[zones]]
 name = "exhaust_zone"
 monitor_sources = ["CPU_Tctl", "CPU_MOSFET", "SYS_Air_Outlet"]
-aggregation = "max"
 target_pins = ["SYS_FAN_2"]
-default_duty_cycle = 30
-debounce_temp = 2
 
 [[zones.thresholds]]
 temperature = 55

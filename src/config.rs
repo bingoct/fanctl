@@ -1,5 +1,6 @@
 //! Configuration loading and cross-file validation.
 
+pub mod defaults;
 pub mod platform;
 pub mod policy;
 
@@ -11,6 +12,7 @@ pub use platform::{parse_hex_byte, PlatformConfig, PlatformInfo};
 pub use policy::{Aggregation, FanConfig, FollowRule, GlobalSettings, Threshold, ZoneConfig};
 
 use crate::error::Error;
+use policy::RawFanConfig;
 
 /// Both configuration files, already validated against each other.
 #[derive(Debug, Clone)]
@@ -28,7 +30,8 @@ impl LoadedConfig {
     /// reports every mistake instead of one per attempt.
     pub fn load(policy_path: &Path, platform_path: &Path) -> Result<Self, Error> {
         let platform: PlatformConfig = read_toml(platform_path)?;
-        let mut policy: FanConfig = read_toml(policy_path)?;
+        let raw: RawFanConfig = read_toml(policy_path)?;
+        let mut policy = FanConfig::from_raw(raw);
         // Names are case-insensitive: fold every reference onto the spelling
         // declared in `platform.toml` before validating, so that `cpu_fan` and
         // `CPU_FAN` cannot end up as two different pins downstream.

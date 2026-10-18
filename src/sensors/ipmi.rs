@@ -12,16 +12,12 @@
 //! `None` so the caller can tell "sensor exists but is not a temperature" apart
 //! from "sensor does not exist".
 
-use std::io;
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::Duration;
 
-use regex::Regex;
-
 use crate::error::Error;
-use crate::process::output_with_timeout;
+use crate::util::process::run_checked;
 
 /// One line of `ipmitool sdr`.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,28 +33,16 @@ pub fn read_sdr(ipmitool: &Path, timeout: Duration) -> Result<Vec<SdrEntry>, Err
     let mut command = Command::new(ipmitool);
     command.arg("sdr");
 
-    let output = output_with_timeout(command, timeout).map_err(|source| {
-        if source.kind() == io::ErrorKind::NotFound {
-            Error::Ipmi(format!(
-                "`{}` not found - install ipmitool or fix [platform].ipmitool_path",
-                ipmitool.display()
-            ))
+    let output = run_checked(command, timeout).map_err(|err| {
+        if err.is_missing_program() {
+            // A missing dependency is not a transient hardware fault.
+            Error::IpmitoolMissing {
+                path: ipmitool.to_path_buf(),
+            }
         } else {
-            Error::Ipmi(format!(
-                "could not run `{} sdr`: {source}",
-                ipmitool.display()
-            ))
+            Error::Command(err)
         }
     })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Ipmi(format!(
-            "`ipmitool sdr` failed with {}: {}",
-            output.status,
-            stderr.trim()
-        )));
-    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(parse_sdr(&stdout))
@@ -94,22 +78,40 @@ pub fn parse_sdr(text: &str) -> Vec<SdrEntry> {
 }
 
 /// Extracts `45` from `45 degrees C`; returns `None` for anything else.
+///
+/// Hand written rather than a regex. For a temperature SDR, `ipmitool` prints
+/// exactly three whitespace separated tokens: `<number> degrees C` (the
+/// `sdr` implementation formats it, it is not free form text). Three tokens
+/// and a case insensitive comparison cover that grammar completely, and the
+/// alternative costs about 1.4 MB of `regex-automata` in the binary.
+///
+/// Differences from the regex it replaces, none of which `ipmitool` can emit:
+/// it rejects `45degrees C` (no space), and it accepts `+5` or `1e3` as the
+/// number, because `f64::from_str` is more liberal than `-?\d+(\.\d+)?`.
+/// Non-finite values are rejected explicitly, so `inf degrees C` cannot become
+/// a threshold comparison.
 fn parse_celsius(value: &str) -> Option<f64> {
-    let captures = celsius_pattern().captures(value)?;
-    let number = captures.get(1)?.as_str();
-    number.parse::<f64>().ok()
-}
+    let mut tokens = value.split_whitespace();
+    let number: f64 = tokens.next()?.parse().ok()?;
+    let degrees = tokens.next()?;
+    let unit = tokens.next()?;
 
-fn celsius_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)^(-?\d+(?:\.\d+)?)\s*degrees?\s+C").expect("static regex is valid")
-    })
+    let is_degrees =
+        degrees.eq_ignore_ascii_case("degree") || degrees.eq_ignore_ascii_case("degrees");
+    if !is_degrees || !unit.eq_ignore_ascii_case("c") || !number.is_finite() {
+        return None;
+    }
+
+    Some(number)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_celsius, parse_sdr};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{parse_celsius, parse_sdr, read_sdr};
+    use crate::error::Error;
 
     const SAMPLE: &str = "\
 CPU_Tctl_Value   | 45 degrees C      | ok
@@ -142,7 +144,33 @@ Broken_Sensor    | no reading        | ns
     fn parsing_is_case_and_space_tolerant() {
         assert_eq!(parse_celsius("41 Degrees C"), Some(41.0));
         assert_eq!(parse_celsius("-5 degrees c"), Some(-5.0));
+        assert_eq!(parse_celsius("  41 degrees C  "), Some(41.0));
         assert_eq!(parse_celsius("41 C"), None);
         assert_eq!(parse_celsius("41 degrees F"), None);
+    }
+
+    #[test]
+    fn malformed_readings_are_rejected() {
+        assert_eq!(parse_celsius(""), None);
+        assert_eq!(parse_celsius("no reading"), None);
+        assert_eq!(parse_celsius("45 degrees"), None);
+        assert_eq!(parse_celsius("45 degrees C (sensor failed)"), Some(45.0));
+    }
+
+    #[test]
+    fn non_finite_readings_are_rejected() {
+        // A threshold comparison against `inf` would pin the fans at 100 %
+        // forever, so a value that parsed must also be a real measurement.
+        assert_eq!(parse_celsius("inf degrees C"), None);
+        assert_eq!(parse_celsius("NaN degrees C"), None);
+    }
+
+    #[test]
+    fn a_missing_binary_is_not_a_hardware_fault() {
+        let missing = PathBuf::from("fanctl-does-not-exist-9c3e");
+        match read_sdr(&missing, Duration::from_secs(5)) {
+            Err(Error::IpmitoolMissing { path }) => assert_eq!(path, missing),
+            other => panic!("expected IpmitoolMissing, got {other:?}"),
+        }
     }
 }

@@ -6,17 +6,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use fanctl::cli::Cli;
+use fanctl::app::cli::Cli;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     fanctl::logging::init(cli.verbose);
-
-    match fanctl::app::run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            tracing::error!("{err}");
-            ExitCode::FAILURE
-        }
-    }
+    fanctl::app::run(cli)
 }

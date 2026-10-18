@@ -8,8 +8,8 @@
 //! | situation | reaction |
 //! |-----------|----------|
 //! | one zone has no reading | hold that zone's last duty cycle |
-//! | a zone never had a reading | use `global.fallback_pwm` |
-//! | *no* sensor at all | `global.fallback_pwm` on every pin |
+//! | a zone never had a reading | use `global.fallback_duty_cycle` |
+//! | *no* sensor at all | `global.fallback_duty_cycle` on every pin |
 //! | `ipmitool` write fails | log, retry next cycle, never exit |
 //! | SIGINT / SIGTERM | each controlled pin -> its zone's `default_duty_cycle`, then exit 0 |
 
@@ -104,22 +104,26 @@ impl Engine {
     /// nothing to restore and must not invent a value.
     fn restore_standby(&mut self) {
         let bounds = &self.policy.global;
-        let standby = standby_targets(&self.policy.zones, bounds.min_pwm, bounds.max_pwm);
+        let standby = standby_targets(
+            &self.policy.zones,
+            bounds.min_duty_cycle,
+            bounds.max_duty_cycle,
+        );
         info!(
             pins = standby.len(),
             "shutdown requested, restoring standby duty cycle"
         );
 
-        for (pin, duty) in standby.iter() {
-            let duty = *duty;
-            match self.actuator.apply(pin, duty) {
+        for (pin, duty_cycle) in standby.iter() {
+            let duty_cycle = *duty_cycle;
+            match self.actuator.apply(pin, duty_cycle) {
                 Ok(()) => {
-                    self.last_sent.insert(pin.clone(), duty);
-                    info!(pin = %pin, duty, "standby duty cycle written");
+                    self.last_sent.insert(pin.clone(), duty_cycle);
+                    info!(pin = %pin, duty_cycle, "standby duty cycle written");
                 }
                 Err(err) => warn!(
                     pin = %pin,
-                    duty,
+                    duty_cycle,
                     error = %err,
                     "could not write standby duty cycle"
                 ),
@@ -141,9 +145,9 @@ impl Engine {
         }
 
         if snapshot.is_empty() {
-            let fallback = self.policy.global.fallback_pwm;
+            let fallback = self.policy.global.fallback_duty_cycle;
             warn!(
-                duty = fallback,
+                duty_cycle = fallback,
                 "no sensor could be read, applying fallback duty cycle"
             );
             self.apply_to_all_pins(fallback);
@@ -162,62 +166,68 @@ impl Engine {
         let mut targets = TargetMap::new();
 
         for (index, zone) in zones.iter().enumerate() {
-            let duty = match super::aggregate(zone, &snapshot) {
+            let duty_cycle = match super::aggregate(zone, &snapshot) {
                 Some(temperature) => {
                     let state = next_band(zone, self.zone_states[index], temperature);
                     self.zone_states[index] = Some(state);
-                    let duty = duty_for_band(zone, state.band);
+                    let duty_cycle = duty_for_band(zone, state.band);
                     trace!(
                         zone = %zone.name,
                         temperature,
                         band = state.band,
-                        duty,
+                        duty_cycle,
                         "zone evaluated"
                     );
-                    duty
+                    duty_cycle
                 }
                 None => {
-                    let held = self.zone_duties[index].unwrap_or(self.policy.global.fallback_pwm);
+                    let held =
+                        self.zone_duties[index].unwrap_or(self.policy.global.fallback_duty_cycle);
                     warn!(
                         zone = %zone.name,
                         sources = ?zone.monitor_sources,
-                        duty = held,
+                        duty_cycle = held,
                         "no reading for zone, holding previous duty cycle"
                     );
                     held
                 }
             };
 
-            self.zone_duties[index] = Some(duty);
+            self.zone_duties[index] = Some(duty_cycle);
             for pin in &zone.target_pins {
-                targets.raise(pin, duty);
+                targets.raise(pin, duty_cycle);
             }
         }
 
         targets.apply_follows(&self.policy.follows);
-        targets.clamp(self.policy.global.min_pwm, self.policy.global.max_pwm);
+        targets.clamp(
+            self.policy.global.min_duty_cycle,
+            self.policy.global.max_duty_cycle,
+        );
         self.dispatch(&targets);
     }
 
     /// Sends the pins whose duty cycle differs from what was last accepted.
     fn dispatch(&mut self, targets: &TargetMap) {
-        for (pin, duty) in targets.iter() {
-            let duty = *duty;
-            if self.last_sent.get(pin).copied() == Some(duty) {
+        for (pin, duty_cycle) in targets.iter() {
+            let duty_cycle = *duty_cycle;
+            if self.last_sent.get(pin).copied() == Some(duty_cycle) {
                 continue;
             }
 
-            match self.actuator.apply(pin, duty) {
+            match self.actuator.apply(pin, duty_cycle) {
                 Ok(()) => {
-                    let previous = self.last_sent.insert(pin.clone(), duty);
+                    let previous = self.last_sent.insert(pin.clone(), duty_cycle);
                     match previous {
-                        Some(from) => info!(pin = %pin, from, to = duty, "duty cycle changed"),
-                        None => info!(pin = %pin, to = duty, "duty cycle set"),
+                        Some(from) => {
+                            info!(pin = %pin, from, to = duty_cycle, "duty cycle changed")
+                        }
+                        None => info!(pin = %pin, to = duty_cycle, "duty cycle set"),
                     }
                 }
                 Err(err) => warn!(
                     pin = %pin,
-                    duty,
+                    duty_cycle,
                     error = %err,
                     "could not apply duty cycle, retrying next cycle"
                 ),
@@ -225,16 +235,16 @@ impl Engine {
         }
     }
 
-    fn apply_to_all_pins(&mut self, duty: u8) {
+    fn apply_to_all_pins(&mut self, duty_cycle: u8) {
         let pins: Vec<String> = self.platform.pins.keys().cloned().collect();
         for pin in pins {
-            match self.actuator.apply(&pin, duty) {
+            match self.actuator.apply(&pin, duty_cycle) {
                 Ok(()) => {
-                    self.last_sent.insert(pin, duty);
+                    self.last_sent.insert(pin, duty_cycle);
                 }
                 Err(err) => warn!(
                     pin = %pin,
-                    duty,
+                    duty_cycle,
                     error = %err,
                     "could not apply safe duty cycle"
                 ),

@@ -10,15 +10,26 @@ categories = ["command-line-utilities", "hardware-support"]
 readme = "README.md"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+# No `color`: fanctl runs in the background, its output goes to journald, and
+# the ANSI machinery (anstream/anstyle) is a measurable share of the binary.
+clap = { version = "4.5", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
 nvml-wrapper = { version = "0.10", optional = true }
-regex = "1"
 serde = { version = "1", features = ["derive"] }
 signal-hook = "0.3"
 thiserror = "1"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+] }
 
 [dev-dependencies]
 tempfile = "3"

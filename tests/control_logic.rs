@@ -11,7 +11,7 @@ fn zone_with(sources: &[&str], aggregation: Aggregation) -> ZoneConfig {
         aggregation,
         target_pins: vec!["CPU_FAN".to_string()],
         default_duty_cycle: 30,
-        debounce_temp: 2.0,
+        debounce_celsius: 2.0,
         thresholds: vec![
             Threshold {
                 temperature: 55.0,

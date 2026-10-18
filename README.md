@@ -6,7 +6,7 @@
 目标环境：**Tyan S8030 + AMD EPYC 7413 + NVIDIA GPU**，Linux + systemd。
 硬件差异全部落在 `platform.toml`，控制逻辑里没有一处十六进制常量。
 
-当前状态：`cargo build` / `cargo test`（45 个测试）/ `cargo clippy --all-targets`（零告警）/
+当前状态：`cargo build` / `cargo test`（58 个测试）/ `cargo clippy --all-targets`（零告警）/
 `cargo fmt --check` 全部通过；控制循环已用假的 `ipmitool` 做过端到端验证。
 **尚未在真实 BMC 上跑过**，上机前务必先跑 `check` 与 `--dry-run`（见"安全须知"）。
 
@@ -41,6 +41,9 @@ journalctl -u fanctl -f
 ```
 
 常用参数：`-c/--config`、`-p/--platform`（可与默认路径不同）、`-v`/`-vv`、`run --dry-run`。
+`-v` 调整日志级别（默认 INFO，`-v` DEBUG，`-vv` TRACE）；`RUST_LOG=debug` 可覆盖它，
+但只接受全局级别（`error|warn|info|debug|trace|off`），不支持 `fanctl::control=trace` 这种按模块的指令——
+写了会打印一行提示并回落到 `-v`，不会静默失效。
 退出码：`0` 正常（含收到 SIGTERM 后优雅退出），`1` 失败（配置错误、ipmitool 不可用等）。
 
 ---
@@ -54,26 +57,30 @@ fanctl/
 ├── src/
 │   ├── main.rs                # 只做：解析 CLI → 初始化日志 → 调 app::run
 │   ├── lib.rs                 # 库入口，分层文档
-│   ├── app.rs                 # 子命令编排：check / run，信号注册
-│   ├── cli.rs                 # clap 定义
-│   ├── error.rs               # thiserror 单错误类型
-│   ├── logging.rs             # tracing → stdout（journald）
-│   ├── name.rs                # 名字归一化（大小写不敏感）
-│   ├── process.rs             # 带超时的子进程执行
+│   ├── error.rs               # 两个错误枚举：Error / CommandError
+│   ├── logging.rs             # tracing → stdout（journald，无 ANSI），进程级配置一次
 │   ├── actuator.rs            # 唯一写主板的地方（渲染模板 + ipmitool）
+│   ├── app.rs                 # 子命令编排：check / run，信号注册
+│   ├── app/
+│   │   └── cli.rs             # clap 定义
+│   ├── config.rs              # 加载 + 两份文件的交叉校验
 │   ├── config/
-│   │   ├── mod.rs             # 加载 + 两份文件的交叉校验
+│   │   ├── defaults.rs        # 两份配置的全部默认值（唯一一处）
 │   │   ├── platform.rs        # platform.toml：引脚 id、传感器名、指令模板
 │   │   └── policy.rs          # config.toml：全局、分区、联动
+│   ├── sensors.rs             # SensorHub、Source、SensorSnapshot
 │   ├── sensors/
-│   │   ├── mod.rs             # SensorHub、Source、SensorSnapshot
 │   │   ├── ipmi.rs            # ipmitool sdr 解析（纯函数，可单测）
 │   │   └── gpu.rs             # nvml-wrapper，惰性初始化 + feature 开关
-│   └── control/
-│       ├── mod.rs             # 聚合（max/mean）
-│       ├── curve.rs           # 非对称防抖状态机
-│       ├── merge.rs           # 冲突取大 → 联动 → 上下限
-│       └── engine.rs          # 控制循环、失败策略、优雅退出
+│   ├── control.rs             # 聚合（max/mean）
+│   ├── control/
+│   │   ├── curve.rs           # 非对称防抖状态机
+│   │   ├── merge.rs           # 冲突取大 → 联动 → 上下限
+│   │   └── engine.rs          # 控制循环、失败策略、优雅退出
+│   ├── util.rs                # 只收纳跨层共用的小工具
+│   └── util/
+│       ├── name.rs            # 名字归一化（大小写不敏感）
+│       └── process.rs         # 子进程：超时即杀、非零退出即错误
 ├── examples/                  # 可直接用的 platform.toml / config.toml
 ├── packaging/fanctl.service   # systemd 单元模板
 └── tests/                     # 集成测试（配置校验、控制逻辑、生命周期）
@@ -101,23 +108,34 @@ fanctl/
 | 字段 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `[global].interval_seconds` | 是 | — | 采样周期，≥1 |
-| `[global].min_pwm` | 是 | — | 全局下限，1..=100 且 ≤ `max_pwm`（不允许停转） |
-| `[global].max_pwm` | 是 | — | 全局上限，≤100 |
-| `[global].fallback_pwm` | 是 | — | **所有**传感器都读不到时的保底转速，必须落在 `min_pwm..=max_pwm` |
+| `[global].min_duty_cycle` | 是 | — | 全局下限，1..=100 且 ≤ `max_duty_cycle`（不允许停转） |
+| `[global].max_duty_cycle` | 是 | — | 全局上限，≤100 |
+| `[global].fallback_duty_cycle` | 是 | — | **所有**传感器都读不到时的保底转速，必须落在 `min_duty_cycle..=max_duty_cycle` |
+| `[global].default_duty_cycle` | 是 | — | 待机转速；分区省略时继承它。必须落在 `min_duty_cycle..=max_duty_cycle`，且不得高于本分区第一档 |
+| `[global].debounce_celsius` | 否 | `2.0` | 降档防抖（℃）；分区省略时继承它 |
+| `[global].aggregation` | 否 | `max` | 聚合方式；分区省略时继承它 |
 | `[global].command_timeout_seconds` | 否 | `5` | 单次 `ipmitool` 的超时，≥1 |
+
+上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息：所有可省略字段的默认值都写在那一个文件里，
+改默认值只需动它，不用先猜字段定义在 `platform.rs` 还是 `policy.rs`。
+运行期调参（子进程轮询退避、关停轮询间隔）不在这里，它们紧贴着各自的循环实现。
 | `[[zones]]` | 是，≥1 个 | — | 整段缺失在加载期报错 |
 | `[[zones]].name` | 是 | — | 唯一（忽略大小写），仅用于日志 |
 | `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` |
-| `[[zones]].aggregation` | 否 | `max` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
+| `[[zones]].aggregation` | 否 | 继承 `[global]` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
 | `[[zones]].target_pins` | 是 | — | 非空，必须在 `[pins]` 里 |
-| `[[zones]].default_duty_cycle` | 是 | — | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
-| `[[zones]].debounce_temp` | 否 | `2.0` | 单侧防抖（只作用于降档），≥0 且必须小于相邻阈值间隔 |
+| `[[zones]].default_duty_cycle` | 否 | 继承 `[global]` | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
+| `[[zones]].debounce_celsius` | 否 | 继承 `[global]` | 单侧防抖（只作用于降档），≥0 且必须小于相邻阈值间隔 |
 | `[[zones]].thresholds` | 是，≥1 条 | — | 缺了在加载期报错 |
 | `[[zones.thresholds]].temperature` | 是 | — | 必须严格升序 |
 | `[[zones.thresholds]].duty_cycle` | 是 | — | 1..=100 |
 | `[[follows]]` | 否 | 无规则 | 整段可以省略；写了才校验 |
 | `[[follows]].pin` | 是 | — | 必须被某个 zone 驱动 |
 | `[[follows]].min_of` | 是 | — | 同上；不能等于 `pin` |
+
+`aggregation`、`default_duty_cycle`、`debounce_celsius` 在 `[global]` 里是**共享策略**：
+分区不写就继承，写了就覆盖。继承在加载时一次性展开（`FanConfig::from_raw`），
+运行期每个分区拿到的都是确定值，不存在"空值再去看全局"的分支。
 
 **名字一律大小写不敏感。** `cpu_fan`、`CPU_FAN`、`Cpu_Fan` 是同一个引脚，
 `"gpu"` 与 `"GPU"` 等价。加载时会把 `config.toml` 里的引用统一改写成
@@ -127,9 +145,10 @@ fanctl/
 `CPU Tctl Value`、`cpu-tctl-value` 视为同一个传感器。
 
 校验项（`fanctl check` 与 `run` 启动时都执行，一次列出全部问题）：
-TOML 语法与未知字段 → 阈值升序 → `debounce_temp` 必须小于相邻阈值间隔 →
+TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于相邻阈值间隔 →
 引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
-`min_pwm ≤ fallback_pwm ≤ max_pwm` → 名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
+`min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` → 待机档在窗口内且不高于第一档 →
+名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
 
 > `deny_unknown_fields` 是刻意开的：写错字段名会直接报错，而不是安静地用了默认值。
 
@@ -153,17 +172,17 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 | 方向 | 条件 | 动作 |
 |------|------|------|
 | 升档 | `温度 >= 阈值` | **立即**切档，可一次跳多档 |
-| 降档 | `温度 <= 当前档阈值 - debounce_temp` | 降一档 |
-| 跌破第一档 | `温度 <= 第一档阈值 - debounce_temp` | 直接回 `default_duty_cycle` |
+| 降档 | `温度 <= 当前档阈值 - debounce_celsius` | 降一档 |
+| 跌破第一档 | `温度 <= 第一档阈值 - debounce_celsius` | 直接回 `default_duty_cycle` |
 | 死区内 | 以上都不满足 | 保持当前 PWM 不变 |
 
-以 `55/70/85 → 40/60/100 %`、`debounce_temp=2` 为例：70 ℃ 升到 60 %，要在
+以 `55/70/85 → 40/60/100 %`、`debounce_celsius=2` 为例：70 ℃ 升到 60 %，要在
 **68 ℃ 才降回 40 %**；但 71 ℃ 会立刻升回 60 %。升温不等，降温不抖。
 
 ### 4.3 合并与兜底（顺序固定）
 1. 各分区算出目标引脚 → **同一引脚取最大值**（绝不覆盖降速）；
 2. `follows` 求不动点（与声明顺序无关）→ `Pwm(A) = max(Pwm(A), Pwm(B))`；
-3. 夹到 `[min_pwm, max_pwm]`；
+3. 夹到 `[min_duty_cycle, max_duty_cycle]`；
 4. 只对"与上次成功下发值不同"的引脚发指令（BMC 不会被每 10 秒刷一遍）。
 
 ### 4.4 失败策略
@@ -171,10 +190,11 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 | 情况 | 反应 |
 |------|------|
 | 某个分区读不到数据 | 保持该分区上一次的转速（不降速） |
-| 该分区从没读到过数据 | 用 `fallback_pwm` |
-| 一个传感器都读不到 | 全部引脚 → `fallback_pwm` |
+| 该分区从没读到过数据 | 用 `fallback_duty_cycle` |
+| 一个传感器都读不到 | 全部引脚 → `fallback_duty_cycle` |
 | `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出、不更新"已下发值" |
-| BMC 挂住不回 | 单次调用有超时，控制循环不会被卡死 |
+| BMC 挂住不回 | 单次调用有超时；超时后**杀掉并回收子进程**（连同两个读管道的线程），循环不会被卡死，也不会每周期漏一个进程 |
+| `ipmitool` 根本不存在 | 报 `IpmitoolMissing`，与"BMC 超时"区分——这一类不会自愈，`check` 直接失败 |
 | SIGINT / SIGTERM | 每个被驱动的引脚 → 所属分区 `default_duty_cycle`，然后退出 0 |
 
 ---
@@ -186,7 +206,7 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 2. **引脚 id 只做了语法校验**。要确证 `0x00` 就是 CPU_FAN，只能实际写一次再听声音/看转速；
    `check` 只能按名称猜（猜不到会给 `[warn]`，不是错误）。第一次正式跑建议单独盯一次
    `journalctl -u fanctl -f`，确认"改的是哪把扇子"。
-3. `min_pwm ≥ 1` 是硬约束，配置里写 0 会直接报错。
+3. `min_duty_cycle ≥ 1` 是硬约束，配置里写 0 会直接报错。
 4. 进程退出时 BMC 保留最后一次写入的值，所以 `SIGTERM` 会把每个被驱动的引脚写回
    所属分区的 `default_duty_cycle`；**没有任何分区驱动的引脚不会被碰**（daemon 从没写过它，
    退出时也不该凭空塞一个值，`check` 会给出 `[warn]`）。

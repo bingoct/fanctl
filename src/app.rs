@@ -1,33 +1,46 @@
-//! Subcommand orchestration: `fanctl check` and `fanctl run`.
+//! Subcommand orchestration: `check` and `run`, plus signal handling.
+
+pub mod cli;
 
 use std::collections::{HashMap, HashSet};
+use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
-use tracing::info;
+use tracing::{error, info};
 
-use crate::cli::{Cli, Command};
+use self::cli::{Cli, Command};
 use crate::config::LoadedConfig;
 use crate::control::{standby_targets, Engine};
 use crate::error::Error;
-use crate::name::sdr_key;
 use crate::sensors::{gpu, ipmi};
+use crate::util::name::sdr_key;
 
 /// Entry point used by `main`.
-pub fn run(cli: Cli) -> Result<(), Error> {
+///
+/// Failures are reported where they happen: `check` prints one line per
+/// problem and never returns an `Err`, so the user does not see the same
+/// message twice (once as `[fail]`, once as a log record).
+pub fn run(cli: Cli) -> ExitCode {
     match &cli.command {
         Command::Check => check(&cli),
-        Command::Run { dry_run } => run_daemon(&cli, *dry_run),
+        Command::Run { dry_run } => match run_daemon(&cli, *dry_run) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!("{err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
 /// Validates the configuration and probes the running hardware.
 ///
 /// Exit code is non-zero when a configured sensor cannot be read, because in
-/// that state the daemon would constantly fall back to `fallback_pwm`.
-fn check(cli: &Cli) -> Result<(), Error> {
+/// that state the daemon would constantly fall back to `fallback_duty_cycle`.
+fn check(cli: &Cli) -> ExitCode {
     println!("fanctl {} - configuration check", crate::VERSION);
     println!("  policy   : {}", cli.config.display());
     println!("  platform : {}", cli.platform.display());
@@ -37,7 +50,7 @@ fn check(cli: &Cli) -> Result<(), Error> {
         Ok(loaded) => loaded,
         Err(err) => {
             println!("[fail] {err}");
-            return Err(Error::Validation("configuration check failed".to_string()));
+            return ExitCode::FAILURE;
         }
     };
 
@@ -56,8 +69,12 @@ fn check(cli: &Cli) -> Result<(), Error> {
         loaded.policy.follows.len()
     );
     println!(
-        "[ ok ] interval {}s, pwm {}..={}, fallback {}",
-        global.interval_seconds, global.min_pwm, global.max_pwm, global.fallback_pwm
+        "[ ok ] interval {}s, duty_cycle {}..={}, fallback {}, standby {}",
+        global.interval_seconds,
+        global.min_duty_cycle,
+        global.max_duty_cycle,
+        global.fallback_duty_cycle,
+        global.default_duty_cycle
     );
 
     for zone in &loaded.policy.zones {
@@ -68,15 +85,19 @@ fn check(cli: &Cli) -> Result<(), Error> {
             zone.aggregation.as_str(),
             zone.target_pins.join(", "),
             zone.default_duty_cycle,
-            zone.debounce_temp,
+            zone.debounce_celsius,
             zone.thresholds.len()
         );
     }
 
-    let standby = standby_targets(&loaded.policy.zones, global.min_pwm, global.max_pwm);
+    let standby = standby_targets(
+        &loaded.policy.zones,
+        global.min_duty_cycle,
+        global.max_duty_cycle,
+    );
     let plan = standby
         .iter()
-        .map(|(pin, duty)| format!("{pin} {duty}%"))
+        .map(|(pin, duty_cycle)| format!("{pin} {duty_cycle}%"))
         .collect::<Vec<_>>()
         .join(", ");
     println!("[ ok ] shutdown restores: {plan}");
@@ -86,7 +107,7 @@ fn check(cli: &Cli) -> Result<(), Error> {
         Ok(entries) => entries,
         Err(err) => {
             println!("[fail] {err}");
-            return Err(err);
+            return ExitCode::FAILURE;
         }
     };
     println!("[ ok ] `ipmitool sdr` returned {} line(s)", entries.len());
@@ -149,11 +170,11 @@ fn check(cli: &Cli) -> Result<(), Error> {
         println!(
             "[fail] {missing} configured sensor(s) cannot be read - fix platform.toml [sensors]"
         );
-        return Err(Error::Validation("configuration check failed".to_string()));
+        return ExitCode::FAILURE;
     }
 
     println!("[ ok ] configuration check passed");
-    Ok(())
+    ExitCode::SUCCESS
 }
 
 /// Validates, installs signal handlers, and hands control to the engine.

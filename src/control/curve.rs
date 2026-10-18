@@ -1,15 +1,15 @@
-//! The per-zone curve and its asymmetric hysteresis.
+//! The per-zone curve and its asymmetric debounce_celsius.
 //!
 //! A band is the position on the curve: band `0` means "below the first
 //! threshold" and uses `default_duty_cycle`, band `n` uses the duty cycle of the
 //! `n`-th threshold.
 //!
 //! Rising temperature is acted on immediately - hardware protection beats
-//! acoustic comfort. Falling temperature is debounced by `debounce_temp`, which
+//! acoustic comfort. Falling temperature is debounced by `debounce_celsius`, which
 //! is what keeps the fans from oscillating around a threshold.
 //!
 //! ```text
-//! duty
+//! duty_cycle
 //!  100 |               +-----------  band 3  (>= 85 C)
 //!   60 |         +-----+             band 2  (>= 70 C)  drops back at 68 C
 //!   40 |   +-----+                   band 1  (>= 55 C)  drops back at 53 C
@@ -27,7 +27,7 @@ pub struct ZoneState {
     pub band: usize,
 }
 
-/// Band implied by `temperature` alone, ignoring any hysteresis.
+/// Band implied by `temperature` alone, ignoring any debounce_celsius.
 pub fn band_for_temperature(zone: &ZoneConfig, temperature: f64) -> usize {
     zone.thresholds
         .iter()
@@ -35,13 +35,13 @@ pub fn band_for_temperature(zone: &ZoneConfig, temperature: f64) -> usize {
         .count()
 }
 
-/// Next band, applying the asymmetric hysteresis.
+/// Next band, applying the asymmetric debounce_celsius.
 ///
 /// * `previous == None` (first evaluation) adopts the temperature band as is.
 /// * Going up is immediate, including several bands at once.
-/// * Going down requires the temperature to be at least `debounce_temp` below
+/// * Going down requires the temperature to be at least `debounce_celsius` below
 ///   the threshold that opened the current band.
-/// * Dropping below `first_threshold - debounce_temp` jumps straight to standby.
+/// * Dropping below `first_threshold - debounce_celsius` jumps straight to standby.
 pub fn next_band(zone: &ZoneConfig, previous: Option<ZoneState>, temperature: f64) -> ZoneState {
     let target = band_for_temperature(zone, temperature);
 
@@ -57,8 +57,8 @@ pub fn next_band(zone: &ZoneConfig, previous: Option<ZoneState>, temperature: f6
         return ZoneState { band: 0 };
     }
 
-    let debounce = if zone.debounce_temp.is_finite() && zone.debounce_temp > 0.0 {
-        zone.debounce_temp
+    let debounce = if zone.debounce_celsius.is_finite() && zone.debounce_celsius > 0.0 {
+        zone.debounce_celsius
     } else {
         0.0
     };
@@ -84,7 +84,7 @@ pub fn next_band(zone: &ZoneConfig, previous: Option<ZoneState>, temperature: f6
 
 /// Duty cycle of `band`, clamped to a duty cycle a fan can actually use.
 pub fn duty_for_band(zone: &ZoneConfig, band: usize) -> u8 {
-    let duty = if band == 0 {
+    let duty_cycle = if band == 0 {
         zone.default_duty_cycle
     } else {
         zone.thresholds
@@ -92,7 +92,7 @@ pub fn duty_for_band(zone: &ZoneConfig, band: usize) -> u8 {
             .map(|threshold| threshold.duty_cycle)
             .unwrap_or(zone.default_duty_cycle)
     };
-    duty.clamp(1, 100)
+    duty_cycle.clamp(1, 100)
 }
 
 #[cfg(test)]
@@ -107,7 +107,7 @@ mod tests {
             aggregation: Aggregation::Max,
             target_pins: vec!["CPU_FAN".to_string()],
             default_duty_cycle: 30,
-            debounce_temp: 2.0,
+            debounce_celsius: 2.0,
             thresholds: vec![
                 Threshold {
                     temperature: 55.0,

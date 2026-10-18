@@ -11,9 +11,9 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::config::PlatformConfig;
-use crate::name::{is_gpu_source, sdr_key};
+use crate::util::name::{is_gpu_source, sdr_key};
 
-pub use crate::name::GPU_SOURCE;
+pub use crate::util::name::GPU_SOURCE;
 
 pub mod gpu;
 pub mod ipmi;
