@@ -46,6 +46,15 @@ gpu = ["dep:nvml-wrapper"]
 codegen-units = 1
 lto = "thin"
 strip = true
+# A panic here is a bug, not a recoverable state: nothing in this crate catches
+# an unwind (`catch_unwind` is absent, production code has no `unwrap`), so the
+# only thing unwinding ever bought was a symbolised backtrace. Aborting instead
+# drops every cleanup landing pad plus the `.eh_frame`/`.gcc_except_table`
+# tables - measured at 29 % of the binary on a PE build.
+#
+# Losing the backtrace is the real cost. When one is needed:
+#   cargo build --release --config 'profile.release.panic="unwind"'
+panic = "abort"
 
 [lints.rust]
 unsafe_code = "forbid"

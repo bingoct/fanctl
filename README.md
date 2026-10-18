@@ -21,7 +21,7 @@ sudo install -Dm755 target/release/fanctl /usr/local/bin/fanctl
 sudo install -Dm644 examples/platform.toml /etc/fanctl/platform.toml
 sudo install -Dm644 examples/config.toml   /etc/fanctl/config.toml
 
-# 1) 静态校验 + 硬件探测（会真的执行一次 ipmitool sdr）
+# 1) 静态校验 + 硬件探测（会真的执行 ipmitool sdr / sdr get / 一次批量 raw 读）
 sudo fanctl check
 
 # 2) 只读演练：读温度、算档位、打日志，不发任何控制指令
@@ -70,7 +70,7 @@ fanctl/
 │   │   └── policy.rs          # config.toml：全局、分区、联动
 │   ├── sensors.rs             # SensorHub、Source、SensorSnapshot
 │   ├── sensors/
-│   │   ├── ipmi.rs            # ipmitool sdr 解析（纯函数，可单测）
+│   │   ├── ipmi.rs            # 批量 raw 读 + sdr 解析（纯函数，可单测）
 │   │   └── gpu.rs             # nvml-wrapper，惰性初始化 + feature 开关
 │   ├── control.rs             # 聚合（max/mean）
 │   ├── control/
@@ -101,7 +101,21 @@ fanctl/
 | `[platform].cmd_template` | 是 | — | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
 | `[platform].ipmitool_path` | 否 | `ipmitool`（走 `$PATH`） | 建议在服务器上写绝对路径 |
 | `[pins]` | 是，≥1 条 | — | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
-| `[sensors]` | 是，≥1 条 | — | 语义名 → `ipmitool sdr` 打印的名字；不允许占用 `GPU` |
+| `[sensors]` | 是，≥1 条 | — | 语义名 → `{ sdr = "…", id = "0xNN" }`；不允许占用 `GPU` |
+
+`[sensors]` 的每条要写两个值，两者都必须对：
+
+```toml
+[sensors]
+"CPU_Tctl" = { sdr = "CPU_Tctl_Value", id = "0x01" }
+```
+
+- `id` 是 IPMI **传感器编号**，控制循环用它读温度（`raw 0x04 0x2d <id>`）。
+- `sdr` 是 `ipmitool sdr` 打印的名字，`check` 用它做诊断和交叉验证。
+
+编号可以从 `ipmitool sdr get '<名字>'` 第一行拿到（`Sensor ID : CPU_Tctl_Value (0x1)`）。
+两个语义名指向同一个编号会在加载期报错；`check` 还会把 raw 读数和 `ipmitool sdr`
+比一遍，差超过 2 ℃ 就判失败——那意味着这块板子的温度不能直接当摄氏度用。
 
 ### 3.2 `config.toml` — 业务逻辑层
 
@@ -136,11 +150,11 @@ fanctl/
 
 上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息，且由
 `tests/config_validation.rs::an_omitted_timeout_gets_the_documented_default` 钉住：
-只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius` 三个字段**可省略且有初值**；
-其余要么必填，要么是"继承 `[global]`"而不是取默认值（分区里的 `aggregation`、
-`default_duty_cycle`、`debounce_celsius` 属于后者）。`aggregation` 自身的默认值写在枚举上
-（`#[default] Max`），不在这个文件里。
-运行期调参（子进程轮询退避、关停轮询间隔）也不在这里，它们紧贴着各自的循环实现。
+只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius`、`aggregation`
+四个字段**可省略且有初值**；其余要么必填，要么是"继承 `[global]`"而不是取默认值
+（分区里的 `aggregation`、`default_duty_cycle`、`debounce_celsius` 属于后者）。
+运行期调参（子进程轮询退避、关停轮询间隔、温度合理性区间）不在这个文件里，
+`defaults.rs` 文件头有一张指路表指向它们的实际位置。
 
 `aggregation`、`default_duty_cycle`、`debounce_celsius` 在 `[global]` 里是**共享策略**：
 分区不写就继承，写了就覆盖。继承在加载时一次性展开（`FanConfig::from_raw`），
@@ -167,7 +181,28 @@ TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于�
 ## 4. 控制算法
 
 ### 4.1 采集与聚合
-`ipmitool sdr` 每条输出取前两列（名字、读数），`45 degrees C` → `45.0`，
+
+控制循环**不读整张 SDR 表**。`ipmitool sdr` 输出 53 行要 2.9 s，因为每一行都是一次
+Get Sensor Reading 往返；按类型过滤（`sdr type temperature`）也一样慢。
+循环只读 `[sensors]` 里被某个分区引用到的那些，一条一个 `raw 0x04 0x2d <id>`，
+全部命令塞进一个 `ipmitool exec` 进程：
+
+| 读法 | 1 个传感器 | 3 个 | 5 个 |
+|---|---|---|---|
+| `ipmitool sdr`（全表） | 2850 ms | 2850 ms | 2850 ms |
+| 按名字 `sdr get` | 158 ms | 648 ms | ~1000 ms |
+| **`exec` + raw（现在用的）** | **105 ms** | **122 ms** | **155 ms** |
+
+（TYAN S8030 / ipmitool 1.8.19 实测。）
+
+`ipmitool exec` 在某一条失败时不会停下，只是不为它输出——直接按行号对应就会把后面的
+读数错位到别的传感器。所以每条读命令前面都插一条 `raw 0x06 0x01`（Get Device ID，
+固定 15 字节）当分隔符：**空洞就是失败的那条**，其余照常使用。
+
+raw 响应第一个字节是原始读数，第二个字节的 bit 5 表示"无读数"（坏传感器会回
+`00 e0 c0 00`，不能当成 0 ℃）。这里不套用 SDR 记录里的 M/B 系数，所以 `check` 必须
+验证这块板子确实是 1:1，否则整个方案不成立。
+
 非温度（`RPM`、`no reading`、`ns`）记为"没有读数"而不是 0 —— 避免把缺数据的源当成低温。
 GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期会自动重试。
 `"GPU"` 只是 `monitor_sources` 里的一个关键字，与主板 SDR 无关：它扫描 NVML 下的
@@ -176,8 +211,9 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 
 聚合只统计"本周期真有值"的源：`mean` 不会因为没插显卡被拖到 0 ℃。
 
-采集是"每周期一次、一次解析"：`monitor_sources` 在加载期就解析成 `Source` 列表
-（`Source::parse`），循环里只遍历这个短列表 + 查一次 HashMap，不再碰字符串。
+采集是"每周期一次、一次解析"：`monitor_sources` 在加载期就解析成 `Source` 列表，
+被引用的传感器名、SDR 名、编号也一次性整理好；循环里只遍历这个短列表，不碰字符串、
+不重建切片。`platform.toml` 里声明了却没被任何分区引用的传感器**完全不读**。
 没有任何分区引用 `GPU` 时，连 NVML 都不会打开（否则一个纯 CPU 的机器会每 10 秒
 重试一次 `dlopen("libnvidia-ml.so")`）。
 
@@ -223,8 +259,9 @@ BMC 自己的风扇策略（或换扇），fanctl 无法让一把扇子低于它
 
 ## 5. 安全须知
 
-1. **先 `check`，再 `--dry-run`，最后才正式跑。** `check` 会真跑一次 `ipmitool sdr`，
-   确认 `[sensors]` 里的名字在这块板子上真的存在。
+1. **先 `check`，再 `--dry-run`，最后才正式跑。** `check` 会真跑一次整张 SDR 表、逐个
+   `ipmitool sdr get`，再做一次批量 raw 读，确认 `[sensors]` 里的名字、编号、读数三者
+   互相吻合；不一致就判失败，不会带着一个错的编号进入控制循环。
 2. **引脚 id 只做了语法校验**。要确证 `0x00` 就是 CPU_FAN，只能实际写一次再听声音/看转速；
    `check` 只能按名称猜（猜不到会给 `[warn]`，不是错误）。第一次正式跑建议单独盯一次
    `journalctl -u fanctl -f`，确认"改的是哪把扇子"。
@@ -268,5 +305,11 @@ cargo build --release --no-default-features   # 无 NVIDIA 驱动的机器
   （MSRV 感知的依赖解析）的下限：更老的 cargo 连 manifest 都读不进去。部署时用 rustup 的 stable
   即可。`Cargo.lock` 入库，保证部署可复现。
 - `#![forbid(unsafe_code)]`；`[lints.clippy] all = "warn"`。
+- **release 用 `panic = "abort"`**：这个 crate 没有 `catch_unwind`，生产代码里也没有
+  `unwrap` / `expect` / `panic!`，会让栈展开的唯一场合是"打了个不该有的 bug"——此时进程
+  无论如何都要死（风扇恢复只走 SIGINT/SIGTERM，两条路都不经过 panic）。改 abort 后，
+  每条 unwind 清理路径、`.eh_frame`、`.gcc_except_table` 都不再生成，实测体积 −29%。
+  代价是 panic 时只打印 `panicked at src/…:line:col`，没有符号化调用栈；需要栈时临时重编：
+  `cargo build --release --config 'profile.release.panic="unwind"'`。
 - 所有需要硬件才能验证的东西都被推到边界：`ipmi::parse_sdr`、`curve`、`merge` 全是纯函数，
   测试不依赖 BMC、不依赖 GPU。
