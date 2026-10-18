@@ -127,6 +127,7 @@ pub fn standby_targets(zones: &[ZoneConfig], min: u8, max: u8) -> TargetMap {
 mod tests {
     use super::{standby_targets, TargetMap};
     use crate::config::{Aggregation, FollowRule, ZoneConfig};
+    use crate::sensors::Source;
 
     fn rule(pin: &str, min_of: &str) -> FollowRule {
         FollowRule {
@@ -138,7 +139,7 @@ mod tests {
     fn zone(name: &str, pin: &str, default_duty_cycle: u8) -> ZoneConfig {
         ZoneConfig {
             name: name.to_string(),
-            monitor_sources: vec!["CPU_Tctl".to_string()],
+            sources: vec![Source::parse("CPU_Tctl")],
             aggregation: Aggregation::Max,
             target_pins: vec![pin.to_string()],
             default_duty_cycle,

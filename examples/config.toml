@@ -15,7 +15,7 @@ fallback_duty_cycle = 60     # used when no sensor can be read at all
 default_duty_cycle = 30      # standby, below the first threshold
 debounce_celsius = 2         # hysteresis applied only when dropping a step
 aggregation = "max"          # max or mean
-# command_timeout_seconds = 5  # deadline for one ipmitool invocation (default 5)
+# command_timeout_seconds = 10 # deadline for one ipmitool invocation (default 10)
 
 # On SIGINT/SIGTERM each pin is set back to its zone's default_duty_cycle, so
 # the BMC does not keep the last (possibly 100 %) value. Pins no zone drives

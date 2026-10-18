@@ -18,7 +18,16 @@ cmd_template = "raw 0x2e 0x44 0xfd 0x19 0x00 {id} 0x01 {pwm}"
 "SYS_FAN_2" = "0x03"
 
 [sensors]
-# semantic name  ->  name printed by `ipmitool sdr`
-"CPU_Tctl"       = "CPU_Tctl_Value"
-"CPU_MOSFET"     = "CPU_MOSFET"
-"SYS_Air_Outlet" = "SYS_Air_Outlet"
+# semantic name -> { sdr = name printed by `ipmitool sdr`, id = IPMI sensor number }
+#
+# Both fields are required. The daemon reads by number (`raw 0x04 0x2d <id>`),
+# which is about 25 times faster than scanning the whole SDR table; the name is
+# what `check` prints and matches, and what catches a sensor that a firmware
+# update renumbered.
+#
+# `fanctl check` compares the raw value against `ipmitool sdr` and fails when
+# they disagree, so a board whose sensors do not map 1:1 cannot be trusted
+# silently.
+"CPU_Tctl"       = { sdr = "CPU_Tctl_Value", id = "0x01" }
+"CPU_MOSFET"     = { sdr = "CPU_MOSFET",     id = "0x20" }
+"SYS_Air_Outlet" = { sdr = "SYS_Air_Outlet", id = "0x31" }

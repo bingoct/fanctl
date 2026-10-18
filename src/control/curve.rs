@@ -99,11 +99,12 @@ pub fn duty_for_band(zone: &ZoneConfig, band: usize) -> u8 {
 mod tests {
     use super::{band_for_temperature, duty_for_band, next_band, ZoneState};
     use crate::config::{Aggregation, Threshold, ZoneConfig};
+    use crate::sensors::Source;
 
     fn cpu_zone() -> ZoneConfig {
         ZoneConfig {
             name: "cpu_zone".to_string(),
-            monitor_sources: vec!["CPU_Tctl".to_string()],
+            sources: vec![Source::parse("CPU_Tctl")],
             aggregation: Aggregation::Max,
             target_pins: vec!["CPU_FAN".to_string()],
             default_duty_cycle: 30,

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::sensors::Source;
 use crate::util::name::normalize;
 
-use super::PlatformConfig;
+use super::{PlatformConfig, DUTY_MAX, DUTY_MIN};
 
 /// Contents of `config.toml`, with every zone fully resolved.
 #[derive(Debug, Clone)]
@@ -34,18 +34,24 @@ pub struct GlobalSettings {
     pub min_duty_cycle: u8,
     /// Hard ceiling applied to every pin.
     pub max_duty_cycle: u8,
-    /// Duty cycle used when no sensor can be read at all.
+    /// Duty cycle used when *nothing* can be read - the blind value.
+    ///
+    /// Not the same question as `default_duty_cycle`, which means "the readings
+    /// are fine and the machine is cool". Blind is not cool: if the BMC stops
+    /// answering, the fans must not settle at the quietest setting, so this
+    /// value is validated to be at least as fast as every zone's standby.
     pub fallback_duty_cycle: u8,
     /// Deadline for a single `ipmitool` invocation.
     #[serde(default = "super::defaults::command_timeout_seconds")]
     pub command_timeout_seconds: u64,
-    /// Standby duty cycle inherited by zones that do not set their own.
+    /// Standby duty cycle inherited by zones that do not set their own: used
+    /// below the first threshold, and written back on shutdown.
     pub default_duty_cycle: u8,
     /// Hysteresis in degrees Celsius inherited by zones that do not set their own.
     #[serde(default = "super::defaults::debounce_celsius")]
     pub debounce_celsius: f64,
     /// Aggregation inherited by zones that do not set their own.
-    #[serde(default)]
+    #[serde(default = "super::defaults::aggregation")]
     pub aggregation: Aggregation,
 }
 
@@ -97,8 +103,9 @@ pub struct RawZone {
 pub struct ZoneConfig {
     /// Unique name, used in logs.
     pub name: String,
-    /// Semantic sensor names; `"GPU"` is reserved for the NVIDIA readings.
-    pub monitor_sources: Vec<String>,
+    /// Sources already parsed from `monitor_sources`. Parsed once at load time
+    /// so that the control loop never turns a string into a source again.
+    pub sources: Vec<Source>,
     /// How the source temperatures are combined.
     pub aggregation: Aggregation,
     /// Pins driven by this zone.
@@ -122,11 +129,10 @@ pub struct Threshold {
 }
 
 /// How several sensor readings become one temperature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Aggregation {
     /// Highest reading of all sources - the safe default.
-    #[default]
     Max,
     /// Arithmetic mean of the available readings.
     Mean,
@@ -165,7 +171,11 @@ impl FanConfig {
             .into_iter()
             .map(|zone| ZoneConfig {
                 name: zone.name,
-                monitor_sources: zone.monitor_sources,
+                sources: zone
+                    .monitor_sources
+                    .iter()
+                    .map(|raw| Source::parse(raw))
+                    .collect(),
                 aggregation: zone.aggregation.unwrap_or(global.aggregation),
                 target_pins: zone.target_pins,
                 default_duty_cycle: zone.default_duty_cycle.unwrap_or(global.default_duty_cycle),
@@ -190,9 +200,11 @@ impl FanConfig {
     /// untouched for [`FanConfig::validate`] to report.
     pub fn resolve_names(&mut self, platform: &PlatformConfig) {
         for zone in &mut self.zones {
-            for source in &mut zone.monitor_sources {
-                if let Some(declared) = platform.find_sensor(source) {
-                    *source = declared.to_string();
+            for source in &mut zone.sources {
+                if let Source::Ipmi(name) = source {
+                    if let Some(declared) = platform.find_sensor(name) {
+                        *name = declared.to_string();
+                    }
                 }
             }
             for pin in &mut zone.target_pins {
@@ -219,8 +231,33 @@ impl FanConfig {
         let mut problems = Vec::new();
         self.validate_global(&mut problems);
         self.validate_zones(platform, &mut problems);
+        self.validate_fallback(&mut problems);
         self.validate_follows(platform, &mut problems);
         problems
+    }
+
+    /// `fallback_duty_cycle` must not be slower than the loudest standby.
+    ///
+    /// Both values answer "what do we do without a temperature", but they
+    /// answer different questions: standby means "measured, and it is cool",
+    /// fallback means "we cannot measure anything at all". Losing every sensor
+    /// must never be quieter than a healthy idle, otherwise a dead BMC would
+    /// silently become the quietest state the machine has.
+    fn validate_fallback(&self, problems: &mut Vec<String>) {
+        let loudest_standby = self
+            .zones
+            .iter()
+            .map(|zone| zone.default_duty_cycle)
+            .max()
+            .unwrap_or(0);
+        if self.global.fallback_duty_cycle < loudest_standby {
+            problems.push(format!(
+                "[global].fallback_duty_cycle ({}) must not be lower than the standby duty cycle \
+                 of the loudest zone ({}): with no readings at all the fans must not spin slower \
+                 than they do at room temperature",
+                self.global.fallback_duty_cycle, loudest_standby
+            ));
+        }
     }
 
     fn validate_global(&self, problems: &mut Vec<String>) {
@@ -231,16 +268,18 @@ impl FanConfig {
         if global.command_timeout_seconds == 0 {
             problems.push("[global].command_timeout_seconds must be at least 1".to_string());
         }
-        if global.min_duty_cycle == 0 {
-            problems.push(
-                "[global].min_duty_cycle must be at least 1 (fans must never stop)".to_string(),
-            );
+        if global.min_duty_cycle < DUTY_MIN {
+            problems.push(format!(
+                "[global].min_duty_cycle must be at least {DUTY_MIN} (fans must never stop)"
+            ));
         }
-        if global.max_duty_cycle > 100
-            || global.min_duty_cycle > 100
-            || global.fallback_duty_cycle > 100
+        if global.max_duty_cycle > DUTY_MAX
+            || global.min_duty_cycle > DUTY_MAX
+            || global.fallback_duty_cycle > DUTY_MAX
         {
-            problems.push("pwm values must stay within 0..=100".to_string());
+            problems.push(format!(
+                "pwm values must stay within {DUTY_MIN}..={DUTY_MAX}"
+            ));
         }
         if global.min_duty_cycle > global.max_duty_cycle {
             problems.push(format!(
@@ -256,8 +295,10 @@ impl FanConfig {
                 global.fallback_duty_cycle, global.min_duty_cycle, global.max_duty_cycle
             ));
         }
-        if global.default_duty_cycle == 0 || global.default_duty_cycle > 100 {
-            problems.push("[global].default_duty_cycle must be within 1..=100".to_string());
+        if !(DUTY_MIN..=DUTY_MAX).contains(&global.default_duty_cycle) {
+            problems.push(format!(
+                "[global].default_duty_cycle must be within {DUTY_MIN}..={DUTY_MAX}"
+            ));
         } else if global.default_duty_cycle < global.min_duty_cycle
             || global.default_duty_cycle > global.max_duty_cycle
         {
@@ -286,20 +327,18 @@ impl FanConfig {
                 problems.push(format!("duplicate zone name `{}`", zone.name));
             }
 
-            if zone.monitor_sources.is_empty() {
+            if zone.sources.is_empty() {
                 problems.push(format!("{label}: monitor_sources must not be empty"));
             }
-            for raw in &zone.monitor_sources {
-                match Source::parse(raw) {
-                    Err(err) => problems.push(format!("{label}: {err}")),
-                    Ok(Source::Ipmi(key)) => {
-                        if !platform.sensors.contains_key(&key) {
-                            problems.push(format!(
-                                "{label}: sensor `{key}` is not defined in platform.toml [sensors]"
-                            ));
-                        }
+            for source in &zone.sources {
+                if let Source::Ipmi(key) = source {
+                    if key.is_empty() {
+                        problems.push(format!("{label}: a monitor source name is empty"));
+                    } else if !platform.sensors.contains_key(key) {
+                        problems.push(format!(
+                            "{label}: sensor `{key}` is not defined in platform.toml [sensors]"
+                        ));
                     }
-                    Ok(Source::Gpu) => {}
                 }
             }
 
@@ -314,9 +353,9 @@ impl FanConfig {
                 }
             }
 
-            if zone.default_duty_cycle == 0 || zone.default_duty_cycle > 100 {
+            if !(DUTY_MIN..=DUTY_MAX).contains(&zone.default_duty_cycle) {
                 problems.push(format!(
-                    "{label}: default_duty_cycle ({}) must be within 1..=100",
+                    "{label}: default_duty_cycle ({}) must be within {DUTY_MIN}..={DUTY_MAX}",
                     zone.default_duty_cycle
                 ));
             }
@@ -346,9 +385,9 @@ impl FanConfig {
 
             let mut previous: Option<f64> = None;
             for threshold in &zone.thresholds {
-                if threshold.duty_cycle == 0 || threshold.duty_cycle > 100 {
+                if !(DUTY_MIN..=DUTY_MAX).contains(&threshold.duty_cycle) {
                     problems.push(format!(
-                        "{label}: duty_cycle ({}) must be within 1..=100",
+                        "{label}: duty_cycle ({}) must be within {DUTY_MIN}..={DUTY_MAX}",
                         threshold.duty_cycle
                     ));
                 }

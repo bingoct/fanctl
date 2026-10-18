@@ -55,14 +55,26 @@ impl PwmActuator {
             .template
             .replace("{id}", id)
             .replace("{pwm}", &format!("0x{duty:02x}"));
-        let command_line = format!("{} {rendered}", self.ipmitool.display());
 
         if self.dry_run {
-            info!(pin, duty, command = %command_line, "dry-run: command not sent");
+            info!(
+                pin,
+                duty,
+                command = %format!("{} {rendered}", self.ipmitool.display()),
+                "dry-run: command not sent"
+            );
             return Ok(());
         }
 
-        debug!(pin, duty, command = %command_line, "sending PWM command");
+        // Built inside the macro on purpose: `tracing` only evaluates field
+        // values when the level is enabled, so a normal run at INFO does not
+        // format a command line it will never print.
+        debug!(
+            pin,
+            duty,
+            command = %format!("{} {rendered}", self.ipmitool.display()),
+            "sending PWM command"
+        );
         let mut command = Command::new(&self.ipmitool);
         command.args(rendered.split_whitespace());
 
@@ -90,7 +102,7 @@ cmd_template = "raw 0x2e {id} {pwm}"
 "CPU_FAN" = "0x00"
 
 [sensors]
-"CPU_Tctl" = "CPU_Tctl_Value"
+"CPU_Tctl" = { sdr = "CPU_Tctl_Value", id = "0x01" }
 "#,
         )
         .expect("test platform must parse")

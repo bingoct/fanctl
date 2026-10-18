@@ -13,7 +13,7 @@ Type=simple
 ExecStart=/usr/local/bin/fanctl run
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=60s
+TimeoutStopSec=120s
 
 # ipmitool opens /dev/ipmi0 directly, which needs root (or a udev rule plus
 # CAP_SYS_RAWIO). Running as root is the supported configuration.
@@ -38,8 +38,8 @@ RestrictSUIDSGID=yes
 # TimeoutStopSec must cover the worst case, not one call: the cycle in flight
 # may be reading sensors (1 x command_timeout_seconds) and writing several pins
 # (N x command_timeout_seconds), and the shutdown path then writes N pins again.
-# With the defaults (5 s, a handful of pins) that is well under a minute; 60 s
-# leaves room for a wired-up board where every call hits the deadline.
+# That is (1 + 2N) x command_timeout_seconds. With the 10 s default this covers
+# up to five pins; add 20 s per extra pin on a bigger board.
 KillSignal=SIGTERM
 
 [Install]

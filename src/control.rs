@@ -12,9 +12,13 @@ pub use engine::Engine;
 pub use merge::{standby_targets, TargetMap};
 
 use crate::config::{Aggregation, ZoneConfig};
-use crate::sensors::{SensorSnapshot, Source};
+use crate::sensors::SensorSnapshot;
 
 /// Combines a zone's sensor readings into the single temperature its curve sees.
+///
+/// Sources were parsed once when the configuration was loaded, so this walks a
+/// short slice and does one hash lookup per source - no string handling on the
+/// cycle path.
 ///
 /// Sources that produced no reading this cycle are skipped rather than treated
 /// as zero: a missing GPU must not silently drag a `mean` zone into standby.
@@ -24,13 +28,8 @@ pub fn aggregate(zone: &ZoneConfig, snapshot: &SensorSnapshot) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0_usize;
 
-    for raw in &zone.monitor_sources {
-        // Validation already rejected unparsable sources; skip defensively.
-        let source = match Source::parse(raw) {
-            Ok(source) => source,
-            Err(_) => continue,
-        };
-        let value = match snapshot.get(&source) {
+    for source in &zone.sources {
+        let value = match snapshot.get(source) {
             Some(value) => value,
             None => continue,
         };

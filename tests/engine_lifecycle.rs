@@ -24,7 +24,7 @@ ipmitool_path = "/nonexistent/ipmitool"
 "CPU_FAN" = "0x00"
 
 [sensors]
-"CPU_Tctl" = "CPU_Tctl_Value"
+"CPU_Tctl" = { sdr = "CPU_Tctl_Value", id = "0x01" }
 "#;
 
 const POLICY: &str = r#"

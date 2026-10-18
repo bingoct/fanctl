@@ -27,7 +27,7 @@ use tracing::{debug, info, trace, warn};
 use crate::actuator::PwmActuator;
 use crate::config::{FanConfig, LoadedConfig, PlatformConfig};
 use crate::error::Error;
-use crate::sensors::SensorHub;
+use crate::sensors::{SensorHub, Source};
 
 use super::curve::{duty_for_band, next_band, ZoneState};
 use super::merge::{driven_pins, standby_targets, TargetMap};
@@ -55,7 +55,15 @@ impl Engine {
     pub fn new(loaded: LoadedConfig, dry_run: bool, shutdown: Arc<AtomicBool>) -> Self {
         let zone_count = loaded.policy.zones.len();
         let timeout = Duration::from_secs(loaded.policy.global.command_timeout_seconds.max(1));
-        let hub = SensorHub::new(&loaded.platform);
+        let all_sources = || {
+            loaded
+                .policy
+                .zones
+                .iter()
+                .flat_map(|zone| zone.sources.iter())
+        };
+        let uses_gpu = all_sources().any(|source| matches!(source, Source::Gpu));
+        let hub = SensorHub::new(&loaded.platform, all_sources(), uses_gpu);
         let actuator = PwmActuator::new(&loaded.platform, dry_run, timeout);
         let driven = driven_pins(&loaded.policy.zones)
             .into_iter()
@@ -187,50 +195,57 @@ impl Engine {
             "cycle readings"
         );
 
-        // Cloned so the loop body never holds a borrow of `self` while the
-        // state vectors are updated. Zones are a handful of small structs.
-        let zones = self.policy.zones.clone();
-        let mut targets = TargetMap::new();
+        // Field-by-field borrows: the loop reads `policy` while it writes the
+        // two state vectors. Cloning the zones every cycle only existed to
+        // dodge the borrow checker.
+        let targets = {
+            let Self {
+                policy,
+                zone_states,
+                zone_duties,
+                ..
+            } = self;
 
-        for (index, zone) in zones.iter().enumerate() {
-            let duty_cycle = match super::aggregate(zone, &snapshot) {
-                Some(temperature) => {
-                    let state = next_band(zone, self.zone_states[index], temperature);
-                    self.zone_states[index] = Some(state);
-                    let duty_cycle = duty_for_band(zone, state.band);
-                    trace!(
-                        zone = %zone.name,
-                        temperature,
-                        band = state.band,
-                        duty_cycle,
-                        "zone evaluated"
-                    );
-                    duty_cycle
-                }
-                None => {
-                    let held =
-                        self.zone_duties[index].unwrap_or(self.policy.global.fallback_duty_cycle);
-                    warn!(
-                        zone = %zone.name,
-                        sources = ?zone.monitor_sources,
-                        duty_cycle = held,
-                        "no reading for zone, holding previous duty cycle"
-                    );
-                    held
-                }
-            };
+            let mut targets = TargetMap::new();
 
-            self.zone_duties[index] = Some(duty_cycle);
-            for pin in &zone.target_pins {
-                targets.raise(pin, duty_cycle);
+            for (index, zone) in policy.zones.iter().enumerate() {
+                let duty_cycle = match super::aggregate(zone, &snapshot) {
+                    Some(temperature) => {
+                        let state = next_band(zone, zone_states[index], temperature);
+                        zone_states[index] = Some(state);
+                        let duty_cycle = duty_for_band(zone, state.band);
+                        trace!(
+                            zone = %zone.name,
+                            temperature,
+                            band = state.band,
+                            duty_cycle,
+                            "zone evaluated"
+                        );
+                        duty_cycle
+                    }
+                    None => {
+                        let held = zone_duties[index].unwrap_or(policy.global.fallback_duty_cycle);
+                        warn!(
+                            zone = %zone.name,
+                            sources = ?zone.sources.iter().map(Source::label).collect::<Vec<_>>(),
+                            duty_cycle = held,
+                            "no reading for zone, holding previous duty cycle"
+                        );
+                        held
+                    }
+                };
+
+                zone_duties[index] = Some(duty_cycle);
+                for pin in &zone.target_pins {
+                    targets.raise(pin, duty_cycle);
+                }
             }
-        }
 
-        targets.apply_follows(&self.policy.follows);
-        targets.clamp(
-            self.policy.global.min_duty_cycle,
-            self.policy.global.max_duty_cycle,
-        );
+            targets.apply_follows(&policy.follows);
+            targets.clamp(policy.global.min_duty_cycle, policy.global.max_duty_cycle);
+            targets
+        };
+
         self.dispatch(&targets);
     }
 

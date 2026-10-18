@@ -214,7 +214,7 @@ fn names_are_case_insensitive_and_resolved_to_the_declared_spelling() {
         );
     let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
     let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("case must not matter");
-    assert_eq!(loaded.policy.zones[0].monitor_sources[0], "CPU_Tctl");
+    assert_eq!(loaded.policy.zones[0].sources[0].label(), "CPU_Tctl");
     assert_eq!(loaded.policy.zones[0].target_pins[0], "CPU_FAN");
 }
 
@@ -267,8 +267,9 @@ fn platform_names_that_only_differ_in_case_are_rejected() {
 #[test]
 fn a_board_sensor_called_gpu_is_rejected() {
     let platform = PLATFORM.replace(
-        r#""SYS_Air_Outlet" = "SYS_Air_Outlet""#,
-        "\"SYS_Air_Outlet\" = \"SYS_Air_Outlet\"\n\"GPU\" = \"GPU_Temp\"",
+        r#""SYS_Air_Outlet" = { sdr = "SYS_Air_Outlet", id = "0x31" }"#,
+        "\"SYS_Air_Outlet\" = { sdr = \"SYS_Air_Outlet\", id = \"0x31\" }\n\
+         \"GPU\" = { sdr = \"GPU_Temp\", id = \"0x02\" }",
     );
     let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
     assert!(error.contains("reserved"), "unexpected error: {error}");
@@ -371,6 +372,64 @@ fn a_global_standby_step_outside_the_window_is_rejected() {
     let error = load_error(&policy);
     assert!(
         error.contains("default_duty_cycle (30)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_blind_fallback_must_not_be_quieter_than_standby() {
+    // `fallback_duty_cycle` belongs to "no readings at all", `default_duty_cycle`
+    // to "readings are fine and it is cool". If losing every sensor produced the
+    // quietest state the machine has, a dead BMC would be silent and invisible.
+    let policy =
+        policy_with(ASCENDING, 2.0).replace("fallback_duty_cycle = 60", "fallback_duty_cycle = 25");
+    let error = load_error(&policy);
+    assert!(
+        error.contains("fallback_duty_cycle") && error.contains("loudest zone"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn an_empty_monitor_source_is_rejected() {
+    let policy = policy_with(ASCENDING, 2.0).replace(
+        r#"monitor_sources = ["CPU_Tctl"]"#,
+        r#"monitor_sources = ["CPU_Tctl", "  "]"#,
+    );
+    let error = load_error(&policy);
+    assert!(
+        error.contains("monitor source name is empty"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn an_omitted_timeout_gets_the_documented_default() {
+    // `policy_with` leaves `command_timeout_seconds` out on purpose: this test
+    // is the machine-checked link between `config/defaults.rs` and README §3.2.
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy_with(ASCENDING, 2.0));
+    let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("valid");
+    assert_eq!(loaded.policy.global.command_timeout_seconds, 10);
+    assert_eq!(loaded.policy.global.debounce_celsius, 2.0);
+    // The fourth default, and the only one that used to live outside the file.
+    assert_eq!(loaded.policy.global.aggregation, Aggregation::Max);
+}
+
+#[test]
+fn a_sensor_number_that_is_not_a_byte_is_rejected() {
+    let platform = PLATFORM.replace(r#"id = "0x20""#, r#"id = "0x100""#);
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(error.contains("single byte"), "unexpected error: {error}");
+}
+
+#[test]
+fn two_sensors_cannot_share_one_number() {
+    // Reading the same number twice would silently give one zone another
+    // zone's temperature; there is no configuration where that is intended.
+    let platform = PLATFORM.replace(r#"id = "0x20""#, r#"id = "0x01""#);
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(
+        error.contains("both use sensor number"),
         "unexpected error: {error}"
     );
 }

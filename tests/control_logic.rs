@@ -2,12 +2,12 @@
 
 use fanctl::config::{Aggregation, FollowRule, Threshold, ZoneConfig};
 use fanctl::control::{aggregate, duty_for_band, next_band, TargetMap, ZoneState};
-use fanctl::sensors::SensorSnapshot;
+use fanctl::sensors::{SensorSnapshot, Source};
 
 fn zone_with(sources: &[&str], aggregation: Aggregation) -> ZoneConfig {
     ZoneConfig {
         name: "test_zone".to_string(),
-        monitor_sources: sources.iter().map(|s| (*s).to_string()).collect(),
+        sources: sources.iter().map(|raw| Source::parse(raw)).collect(),
         aggregation,
         target_pins: vec!["CPU_FAN".to_string()],
         default_duty_cycle: 30,

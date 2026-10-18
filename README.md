@@ -114,11 +114,12 @@ fanctl/
 | `[global].default_duty_cycle` | 是 | — | 待机转速；分区省略时继承它。必须落在 `min_duty_cycle..=max_duty_cycle`，且不得高于本分区第一档 |
 | `[global].debounce_celsius` | 否 | `2.0` | 降档防抖（℃）；分区省略时继承它 |
 | `[global].aggregation` | 否 | `max` | 聚合方式；分区省略时继承它 |
-| `[global].command_timeout_seconds` | 否 | `5` | 单次 `ipmitool` 的超时，≥1 |
+| `[global].command_timeout_seconds` | 否 | `10` | 单次 `ipmitool` 的超时，≥1 |
 
-上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息：所有可省略字段的默认值都写在那一个文件里，
-改默认值只需动它，不用先猜字段定义在 `platform.rs` 还是 `policy.rs`。
-运行期调参（子进程轮询退避、关停轮询间隔）不在这里，它们紧贴着各自的循环实现。
+分区与联动：
+
+| 字段 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
 | `[[zones]]` | 是，≥1 个 | — | 整段缺失在加载期报错 |
 | `[[zones]].name` | 是 | — | 唯一（忽略大小写），仅用于日志 |
 | `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` |
@@ -132,6 +133,14 @@ fanctl/
 | `[[follows]]` | 否 | 无规则 | 整段可以省略；写了才校验 |
 | `[[follows]].pin` | 是 | — | 必须被某个 zone 驱动 |
 | `[[follows]].min_of` | 是 | — | 同上；不能等于 `pin` |
+
+上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息，且由
+`tests/config_validation.rs::an_omitted_timeout_gets_the_documented_default` 钉住：
+只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius` 三个字段**可省略且有初值**；
+其余要么必填，要么是"继承 `[global]`"而不是取默认值（分区里的 `aggregation`、
+`default_duty_cycle`、`debounce_celsius` 属于后者）。`aggregation` 自身的默认值写在枚举上
+（`#[default] Max`），不在这个文件里。
+运行期调参（子进程轮询退避、关停轮询间隔）也不在这里，它们紧贴着各自的循环实现。
 
 `aggregation`、`default_duty_cycle`、`debounce_celsius` 在 `[global]` 里是**共享策略**：
 分区不写就继承，写了就覆盖。继承在加载时一次性展开（`FanConfig::from_raw`），
@@ -147,8 +156,9 @@ fanctl/
 校验项（`fanctl check` 与 `run` 启动时都执行，一次列出全部问题）：
 TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于相邻阈值间隔 →
 引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
-`min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` → 待机档在窗口内且不高于第一档 →
-名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
+`min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` →
+`fallback_duty_cycle` 不低于任何分区的待机档（失去全部读数不该比"测到很凉"更安静）→
+待机档在窗口内且不高于第一档 → 名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
 
 > `deny_unknown_fields` 是刻意开的：写错字段名会直接报错，而不是安静地用了默认值。
 
@@ -166,6 +176,11 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 
 聚合只统计"本周期真有值"的源：`mean` 不会因为没插显卡被拖到 0 ℃。
 
+采集是"每周期一次、一次解析"：`monitor_sources` 在加载期就解析成 `Source` 列表
+（`Source::parse`），循环里只遍历这个短列表 + 查一次 HashMap，不再碰字符串。
+没有任何分区引用 `GPU` 时，连 NVML 都不会打开（否则一个纯 CPU 的机器会每 10 秒
+重试一次 `dlopen("libnvidia-ml.so")`）。
+
 ### 4.2 非对称防抖（快升慢降）
 不引入滑动滤波，只用单侧迟滞，档位 `n` 对应第 `n` 个阈值：
 
@@ -178,6 +193,13 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 
 以 `55/70/85 → 40/60/100 %`、`debounce_celsius=2` 为例：70 ℃ 升到 60 %，要在
 **68 ℃ 才降回 40 %**；但 71 ℃ 会立刻升回 60 %。升温不等，降温不抖。
+
+**曲线的低端可能没有区分度。** 风扇有最低转速，占空比再往下压转速也不会更低。
+实测某 TYAN S8030（TYAN 原厂扇）：30 % = 690 RPM 就是地板，40 % = 828，
+60 % = 1242，100 % = 1932。所以 `min_duty_cycle` 和待机档若都落在地板以下，
+写 25 还是 30 转速完全一样——**那些数字不生效，不是配置写错了**。想更安静只能改
+BMC 自己的风扇策略（或换扇），fanctl 无法让一把扇子低于它自己的最低转速。
+反过来说，按 30 % 待机是"物理上最安静"的选择，不必再往低调。
 
 ### 4.3 合并与兜底（顺序固定）
 1. 各分区算出目标引脚 → **同一引脚取最大值**（绝不覆盖降速）；
@@ -210,7 +232,8 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 4. 进程退出时 BMC 保留最后一次写入的值，所以 `SIGTERM` 会把每个被驱动的引脚写回
    所属分区的 `default_duty_cycle`；**没有任何分区驱动的引脚不会被碰**（daemon 从没写过它，
    退出时也不该凭空塞一个值，`check` 会给出 `[warn]`）。
-   `TimeoutStopSec` 必须大于一次 `ipmitool` 超时，否则 systemd 会在优雅退出做到一半时 SIGKILL。
+   `TimeoutStopSec` 必须覆盖最坏情况 `(1 + 2N) × command_timeout_seconds`（N = 被驱动的引脚数：
+   退出时可能还有一轮在跑的读 + N 次写，加上复位 N 次写），否则 systemd 会在优雅退出做到一半时 SIGKILL。
 5. `ipmitool` 需要 root（或 udev 规则 + `CAP_SYS_RAWIO`）；unit 里刻意**没有**加
    `PrivateDevices=yes` 这类会屏蔽 `/dev/ipmi*` 的选项。
 6. BIOS 里若把风扇策略设成 "Full Speed" 或某些 BMC 会在重启后重置 PWM，
@@ -221,8 +244,8 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 ## 6. 已知限制 / 后续可做
 
 - **没有 SIGHUP 热重载**：改配置需 `systemctl restart`（有意为之，配置错误时不会带着半套参数跑）。
-- **`command_timeout_seconds` 要按实测的 SDR 读取时间给**：BMC 读全表常常要 2～3 s（TYAN S8030
-  实测 2.9 s），默认 5 s 只留了不到 2 倍余量，给到 10 更稳。周期已经是"含本轮耗时的周期"，
+- **`command_timeout_seconds` 默认 10 s 是按实测定的**：BMC 读全表常常要 2～3 s（TYAN S8030
+  实测 2.9 s，满负载时抖到 6 s），给 10 才有余量。周期是"含本轮耗时的周期"，
   但 SDR 读取时间超过 `interval_seconds` 时循环会变成连续采样，日志里会出现
   "cycle overran the interval"。
 - **状态不落盘**：重启后从当前温度重新定档（升温路径本来就无防抖，不会因此过热）。

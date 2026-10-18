@@ -20,8 +20,34 @@ pub struct PlatformConfig {
     pub info: PlatformInfo,
     /// Logical pin name -> hexadecimal fan id, e.g. `CPU_FAN = "0x00"`.
     pub pins: BTreeMap<String, String>,
-    /// Semantic sensor name -> the name printed by `ipmitool sdr`.
-    pub sensors: BTreeMap<String, String>,
+    /// Semantic sensor name -> how to read it.
+    pub sensors: BTreeMap<String, SensorSpec>,
+}
+
+/// One temperature sensor: its SDR name and its IPMI sensor number.
+///
+/// Both are needed. The number drives the read (`raw 0x04 0x2d <n>`, which is
+/// 25 times faster than `ipmitool sdr` on a TYAN S8030), and the name is what
+/// `check` prints, matches against the SDR table, and uses to catch a sensor
+/// that was renumbered by a firmware update.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensorSpec {
+    /// Name exactly as `ipmitool sdr` prints it.
+    pub sdr: String,
+    /// IPMI sensor number, written like a pin id (`"0x01"`).
+    #[serde(deserialize_with = "deserialize_hex_byte")]
+    pub id: u8,
+}
+
+/// Deserializes a hex byte eagerly, so an invalid number is a load error
+/// pointing at the file rather than a failure in the control loop.
+fn deserialize_hex_byte<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    parse_hex_byte(&raw).map_err(serde::de::Error::custom)
 }
 
 /// Static board description.
@@ -73,12 +99,21 @@ impl PlatformConfig {
                 problems.push(format!("[pins].{name}: {err}"));
             }
         }
-        for (name, sdr_name) in &self.sensors {
+        let mut sensor_ids: HashMap<u8, &str> = HashMap::new();
+        for (name, spec) in &self.sensors {
             if name.trim().is_empty() {
                 problems.push("[sensors] contains an empty sensor name".to_string());
             }
-            if sdr_name.trim().is_empty() {
-                problems.push(format!("[sensors].{name}: SDR name must not be empty"));
+            if spec.sdr.trim().is_empty() {
+                problems.push(format!("[sensors].{name}: sdr must not be empty"));
+            }
+            // Two names for one number means one of them reads the other's
+            // temperature; there is no reading in which that is intended.
+            if let Some(first) = sensor_ids.insert(spec.id, name.as_str()) {
+                problems.push(format!(
+                    "[sensors]: `{first}` and `{name}` both use sensor number 0x{:02x}",
+                    spec.id
+                ));
             }
         }
 

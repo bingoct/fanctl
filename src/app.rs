@@ -9,14 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use self::cli::{Cli, Command};
 use crate::config::LoadedConfig;
 use crate::control::{standby_targets, Engine};
 use crate::error::Error;
-use crate::sensors::{gpu, ipmi};
+use crate::sensors::{gpu, ipmi, Source};
 use crate::util::name::sdr_key;
+
+/// Tolerance when comparing the raw byte against `ipmitool sdr`, in Celsius.
+///
+/// The two readings are seconds apart (`ipmitool sdr` is a 2.9 s scan), so a
+/// machine under light load can move a degree. A board whose M/B coefficients
+/// are not 1:1 is off by tens of degrees, not by two.
+const RAW_READ_TOLERANCE_CELSIUS: f64 = 2.0;
 
 /// Entry point used by `main`.
 ///
@@ -81,7 +88,11 @@ fn check(cli: &Cli) -> ExitCode {
         println!(
             "[ ok ] zone `{}`: [{}] {} -> [{}], standby {}%, debounce {} C, {} threshold(s)",
             zone.name,
-            zone.monitor_sources.join(", "),
+            zone.sources
+                .iter()
+                .map(Source::label)
+                .collect::<Vec<_>>()
+                .join(", "),
             zone.aggregation.as_str(),
             zone.target_pins.join(", "),
             zone.default_duty_cycle,
@@ -117,19 +128,112 @@ fn check(cli: &Cli) -> ExitCode {
         .map(|entry| (sdr_key(&entry.name), entry.celsius))
         .collect();
 
+    // Read the same sensors by number, in one process: this is the path the
+    // control loop uses. It proves two things at once - that the numbers in
+    // `platform.toml` address the sensors named next to them, and that the raw
+    // byte really is degrees Celsius on this board (the M/B coefficients from
+    // the SDR record are not applied anywhere).
+    let numbers: Vec<u8> = platform.sensors.values().map(|spec| spec.id).collect();
+    let script = ipmi::build_script(&numbers);
+    let raw_values: Vec<Option<f64>> = match ipmi::read_sensors(
+        &platform.info.ipmitool_path,
+        &script,
+        numbers.len(),
+        timeout,
+    ) {
+        Ok(batch) => {
+            if let Some(details) = &batch.failure {
+                println!("[warn] batched raw read: {details}");
+            }
+            batch.values
+        }
+        Err(err) => {
+            println!("[fail] batched raw read failed: {err}");
+            vec![None; numbers.len()]
+        }
+    };
+
     let mut missing = 0_usize;
-    for (semantic, sdr_name) in &platform.sensors {
-        match index.get(&sdr_key(sdr_name)) {
-            Some(Some(celsius)) => {
-                println!("[ ok ] sensor `{semantic}` <- `{sdr_name}` = {celsius} C");
+    let mut raw_readings = raw_values.into_iter();
+    for (semantic, spec) in &platform.sensors {
+        let raw_value = raw_readings.next().flatten();
+
+        let listed = match index.get(&sdr_key(&spec.sdr)) {
+            None => {
+                missing += 1;
+                println!(
+                    "[fail] sensor `{semantic}` <- `{}` (0x{:02x}) is absent from `ipmitool sdr`",
+                    spec.sdr, spec.id
+                );
+                continue;
             }
             Some(None) => {
                 missing += 1;
-                println!("[fail] sensor `{semantic}` <- `{sdr_name}` reports no temperature");
+                println!(
+                    "[fail] sensor `{semantic}` <- `{}` (0x{:02x}) reports no temperature",
+                    spec.sdr, spec.id
+                );
+                continue;
+            }
+            Some(Some(celsius)) => *celsius,
+        };
+
+        let detail =
+            match ipmi::read_sensor_detail(&platform.info.ipmitool_path, &spec.sdr, timeout) {
+                Ok(detail) => detail,
+                Err(err) => {
+                    println!("[warn] sensor `{semantic}`: {err}");
+                    continue;
+                }
+            };
+        if !detail.found {
+            missing += 1;
+            println!(
+                "[fail] sensor `{semantic}` <- `{}`: the BMC has no sensor with that name",
+                spec.sdr
+            );
+            continue;
+        }
+        // The number is what the control loop actually reads. A wrong one does
+        // not fail there, it samples a different sensor - so it is fatal here.
+        if let Some(reported) = detail.number {
+            if reported != spec.id {
+                missing += 1;
+                println!(
+                    "[fail] sensor `{semantic}`: platform.toml says 0x{:02x}, but the BMC says \
+                     `{}` is sensor 0x{:02x} - the raw read would sample a different sensor",
+                    spec.id, spec.sdr, reported
+                );
+                continue;
+            }
+        }
+
+        let threshold = detail
+            .upper_critical
+            .map(|limit| format!(", upper critical {limit} C"))
+            .unwrap_or_default();
+
+        match raw_value {
+            Some(raw) if (raw - listed).abs() <= RAW_READ_TOLERANCE_CELSIUS => println!(
+                "[ ok ] sensor `{semantic}` <- `{}` (0x{:02x}) = {listed} C, raw {raw} C{threshold}",
+                spec.sdr, spec.id
+            ),
+            Some(raw) => {
+                missing += 1;
+                println!(
+                    "[fail] sensor `{semantic}` (0x{:02x}): raw reads {raw} C but `sdr` says \
+                     {listed} C - the raw byte is not 1:1 on this board, so fanctl cannot use it \
+                     without applying the SDR coefficients{threshold}",
+                    spec.id
+                );
             }
             None => {
                 missing += 1;
-                println!("[fail] sensor `{semantic}` <- `{sdr_name}` absent from `ipmitool sdr`");
+                println!(
+                    "[fail] sensor `{semantic}` (0x{:02x}): `sdr` has {listed} C but the raw read \
+                     returned nothing{threshold}",
+                    spec.id
+                );
             }
         }
     }
@@ -180,6 +284,23 @@ fn check(cli: &Cli) -> ExitCode {
 /// Validates, installs signal handlers, and hands control to the engine.
 fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
     let loaded = LoadedConfig::load(&cli.config, &cli.platform)?;
+
+    // Catches a wrong sensor number before the loop starts. It is checked once
+    // here rather than every cycle: `ipmitool sdr get` costs 160 ms per sensor,
+    // which is exactly the cost the raw read exists to avoid.
+    let problems = verify_sensor_numbers(&loaded);
+    if !problems.is_empty() {
+        let details = problems
+            .iter()
+            .map(|problem| format!("  - {problem}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(Error::Validation(format!(
+            "{} sensor problem(s) found:\n{details}",
+            problems.len()
+        )));
+    }
+
     info!(
         board = %loaded.platform.info.name,
         zones = loaded.policy.zones.len(),
@@ -197,6 +318,50 @@ fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
     }
 
     Engine::new(loaded, dry_run, shutdown).run()
+}
+
+/// Confirms every configured sensor number belongs to the name written next to
+/// it.
+///
+/// A run-time read by number cannot tell a typo from a working sensor: on the
+/// TYAN S8030, `raw 0x04 0x2d 0x99` answers 172 C because 0x99 *is* a sensor -
+/// just not `CPU_Tctl_Value`. The loop would then control the fans from the
+/// wrong temperature, which is worse than having no reading at all.
+///
+/// A BMC that does not answer in time is deliberately not a failure: the loop
+/// is built to survive that, and refusing to start would turn a slow BMC into a
+/// restart loop.
+fn verify_sensor_numbers(loaded: &LoadedConfig) -> Vec<String> {
+    let platform = &loaded.platform;
+    let timeout = Duration::from_secs(loaded.policy.global.command_timeout_seconds.max(1));
+    let mut problems = Vec::new();
+
+    for (semantic, spec) in &platform.sensors {
+        match ipmi::read_sensor_detail(&platform.info.ipmitool_path, &spec.sdr, timeout) {
+            Ok(detail) if !detail.found => problems.push(format!(
+                "[sensors].{semantic}: the BMC has no sensor called `{}`",
+                spec.sdr
+            )),
+            Ok(detail) => {
+                if let Some(reported) = detail.number {
+                    if reported != spec.id {
+                        problems.push(format!(
+                            "[sensors].{semantic}: platform.toml says 0x{:02x}, but `{}` is \
+                             sensor 0x{:02x} - the daemon would read a different sensor",
+                            spec.id, spec.sdr, reported
+                        ));
+                    }
+                }
+            }
+            Err(err) => warn!(
+                sensor = %semantic,
+                error = %err,
+                "cannot verify the sensor number right now, continuing without that check"
+            ),
+        }
+    }
+
+    problems
 }
 
 /// Best effort: finds a fan sensor whose name corresponds to the pin name.

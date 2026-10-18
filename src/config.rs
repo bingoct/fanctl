@@ -8,11 +8,22 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
-pub use platform::{parse_hex_byte, PlatformConfig, PlatformInfo};
+pub use platform::{parse_hex_byte, PlatformConfig, PlatformInfo, SensorSpec};
 pub use policy::{Aggregation, FanConfig, FollowRule, GlobalSettings, Threshold, ZoneConfig};
 
 use crate::error::Error;
 use policy::RawFanConfig;
+
+/// Lowest duty cycle a configuration may use, in percent.
+///
+/// Not a default but a contract: fans must never be stopped, so zero is
+/// rejected everywhere a duty cycle can appear. Kept next to the loader because
+/// every value below the first threshold, every curve step, and the fallback
+/// all share it.
+pub const DUTY_MIN: u8 = 1;
+
+/// Highest duty cycle a configuration may use, in percent.
+pub const DUTY_MAX: u8 = 100;
 
 /// Both configuration files, already validated against each other.
 #[derive(Debug, Clone)]
