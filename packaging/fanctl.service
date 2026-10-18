@@ -13,7 +13,7 @@ Type=simple
 ExecStart=/usr/local/bin/fanctl run
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=20s
+TimeoutStopSec=60s
 
 # ipmitool opens /dev/ipmi0 directly, which needs root (or a udev rule plus
 # CAP_SYS_RAWIO). Running as root is the supported configuration.
@@ -33,8 +33,13 @@ RestrictSUIDSGID=yes
 # SIGTERM lets fanctl write each zone's default_duty_cycle back to its pins
 # before exiting. The BMC keeps the last value written, so stopping the unit
 # never leaves the fans at the last hot-cycle setting. Pins no zone drives are
-# not touched. TimeoutStopSec must stay larger than one ipmitool timeout,
-# otherwise systemd kills the daemon mid-shutdown.
+# not touched.
+#
+# TimeoutStopSec must cover the worst case, not one call: the cycle in flight
+# may be reading sensors (1 x command_timeout_seconds) and writing several pins
+# (N x command_timeout_seconds), and the shutdown path then writes N pins again.
+# With the defaults (5 s, a handful of pins) that is well under a minute; 60 s
+# leaves room for a wired-up board where every call hits the deadline.
 KillSignal=SIGTERM
 
 [Install]

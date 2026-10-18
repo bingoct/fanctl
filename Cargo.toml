@@ -2,7 +2,9 @@
 name = "fanctl"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Floor imposed by `resolver = "3"` (the MSRV-aware resolver), not by a
+# language feature: an older cargo cannot even parse this manifest.
+rust-version = "1.84"
 resolver = "3"
 description = "Hardware-agnostic IPMI fan control daemon for server boards"
 keywords = ["ipmi", "fan", "daemon", "server", "pwm"]

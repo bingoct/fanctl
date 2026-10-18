@@ -9,7 +9,7 @@
 //!    resolve regardless of declaration order).
 //! 3. **Limits**: every value is clamped into `[min_duty_cycle, max_duty_cycle]`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{FollowRule, ZoneConfig};
 
@@ -89,6 +89,20 @@ impl TargetMap {
             *duty_cycle = (*duty_cycle).clamp(lower, upper);
         }
     }
+}
+
+/// Every pin at least one zone drives.
+///
+/// This is the set the daemon is allowed to touch at all. `platform.toml`
+/// describes the whole board, including headers no zone was pointed at (empty
+/// fan headers, unused channels); writing those would change hardware the
+/// daemon never took responsibility for - and, since shutdown only restores
+/// what it drives, leave them at whatever the last write was.
+pub fn driven_pins(zones: &[ZoneConfig]) -> BTreeSet<&str> {
+    zones
+        .iter()
+        .flat_map(|zone| zone.target_pins.iter().map(String::as_str))
+        .collect()
 }
 
 /// Standby duty cycle of every pin the daemon drives, used on shutdown.
@@ -197,6 +211,19 @@ mod tests {
         assert_eq!(map.get("CPU_FAN"), Some(30));
         assert_eq!(map.get("SYS_FAN_1"), Some(45));
         assert_eq!(map.get("SYS_FAN_2"), None);
+    }
+
+    #[test]
+    fn driven_pins_are_exactly_the_zone_targets() {
+        let zones = vec![zone("cpu", "CPU_FAN", 30), zone("case", "SYS_FAN_1", 30)];
+        let driven: Vec<&str> = super::driven_pins(&zones).into_iter().collect();
+        assert_eq!(driven, vec!["CPU_FAN", "SYS_FAN_1"]);
+    }
+
+    #[test]
+    fn driven_pins_are_deduplicated() {
+        let zones = vec![zone("a", "CPU_FAN", 30), zone("b", "CPU_FAN", 30)];
+        assert_eq!(super::driven_pins(&zones).len(), 1);
     }
 
     #[test]

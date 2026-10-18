@@ -9,15 +9,18 @@
 //! |-----------|----------|
 //! | one zone has no reading | hold that zone's last duty cycle |
 //! | a zone never had a reading | use `global.fallback_duty_cycle` |
-//! | *no* sensor at all | `global.fallback_duty_cycle` on every pin |
+//! | *no* sensor at all | `global.fallback_duty_cycle` on every driven pin |
 //! | `ipmitool` write fails | log, retry next cycle, never exit |
 //! | SIGINT / SIGTERM | each controlled pin -> its zone's `default_duty_cycle`, then exit 0 |
+//!
+//! Only pins a zone drives are ever written. `platform.toml` describes the whole
+//! board, and the spare headers in it are not the daemon's to touch.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, trace, warn};
 
@@ -27,7 +30,7 @@ use crate::error::Error;
 use crate::sensors::SensorHub;
 
 use super::curve::{duty_for_band, next_band, ZoneState};
-use super::merge::{standby_targets, TargetMap};
+use super::merge::{driven_pins, standby_targets, TargetMap};
 
 /// How often the shutdown flag is checked while sleeping.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
@@ -41,6 +44,8 @@ pub struct Engine {
     zone_states: Vec<Option<ZoneState>>,
     zone_duties: Vec<Option<u8>>,
     last_sent: BTreeMap<String, u8>,
+    /// Pins at least one zone drives; the only ones the daemon may write.
+    driven: Vec<String>,
     shutdown: Arc<AtomicBool>,
     timeout: Duration,
 }
@@ -52,6 +57,10 @@ impl Engine {
         let timeout = Duration::from_secs(loaded.policy.global.command_timeout_seconds.max(1));
         let hub = SensorHub::new(&loaded.platform);
         let actuator = PwmActuator::new(&loaded.platform, dry_run, timeout);
+        let driven = driven_pins(&loaded.policy.zones)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
 
         Self {
             platform: loaded.platform,
@@ -61,17 +70,22 @@ impl Engine {
             zone_states: vec![None; zone_count],
             zone_duties: vec![None; zone_count],
             last_sent: BTreeMap::new(),
+            driven,
             shutdown,
             timeout,
         }
     }
 
     /// Runs until the shutdown flag is raised.
+    ///
+    /// `interval_seconds` is the period between two cycles, not the time slept
+    /// after one: `ipmitool sdr` alone takes seconds on a real BMC, so sleeping
+    /// the full interval would turn a 10 s period into a 13 s one.
     pub fn run(mut self) -> Result<(), Error> {
         info!(
             board = %self.platform.info.name,
             zones = self.policy.zones.len(),
-            pins = self.platform.pins.len(),
+            pins = self.driven.len(),
             interval_seconds = self.policy.global.interval_seconds,
             dry_run = self.actuator.is_dry_run(),
             "control loop started"
@@ -82,8 +96,21 @@ impl Engine {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
+
+            let started = Instant::now();
             self.tick();
-            if self.sleep_interruptibly(interval) {
+            let elapsed = started.elapsed();
+            if elapsed > interval {
+                warn!(
+                    elapsed = ?elapsed,
+                    interval_seconds = interval.as_secs(),
+                    "cycle overran the interval: the BMC cannot be polled this fast"
+                );
+            }
+
+            // Overrun means sleep zero, not sleep negative. The cycle itself
+            // costs seconds, so this cannot become a busy loop.
+            if self.sleep_interruptibly(interval.saturating_sub(elapsed)) {
                 break;
             }
         }
@@ -235,8 +262,14 @@ impl Engine {
         }
     }
 
+    /// Applies `duty_cycle` to every pin a zone drives.
+    ///
+    /// Pins no zone drives are skipped for the same reason shutdown skips them:
+    /// the daemon never took responsibility for those headers, and since the
+    /// shutdown path would not restore them, writing them here would leave the
+    /// BMC holding a value nobody owns.
     fn apply_to_all_pins(&mut self, duty_cycle: u8) {
-        let pins: Vec<String> = self.platform.pins.keys().cloned().collect();
+        let pins = self.driven.clone();
         for pin in pins {
             match self.actuator.apply(&pin, duty_cycle) {
                 Ok(()) => {

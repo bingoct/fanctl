@@ -107,7 +107,7 @@ fanctl/
 
 | 字段 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `[global].interval_seconds` | 是 | — | 采样周期，≥1 |
+| `[global].interval_seconds` | 是 | — | 采样**周期**（≥1）。周期含本轮耗时，不是"跑完再睡这么久" |
 | `[global].min_duty_cycle` | 是 | — | 全局下限，1..=100 且 ≤ `max_duty_cycle`（不允许停转） |
 | `[global].max_duty_cycle` | 是 | — | 全局上限，≤100 |
 | `[global].fallback_duty_cycle` | 是 | — | **所有**传感器都读不到时的保底转速，必须落在 `min_duty_cycle..=max_duty_cycle` |
@@ -191,7 +191,7 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 |------|------|
 | 某个分区读不到数据 | 保持该分区上一次的转速（不降速） |
 | 该分区从没读到过数据 | 用 `fallback_duty_cycle` |
-| 一个传感器都读不到 | 全部引脚 → `fallback_duty_cycle` |
+| 一个传感器都读不到 | 所有**被分区驱动**的引脚 → `fallback_duty_cycle`（没人管的引脚不碰，理由同退出复位） |
 | `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出、不更新"已下发值" |
 | BMC 挂住不回 | 单次调用有超时；超时后**杀掉并回收子进程**（连同两个读管道的线程），循环不会被卡死，也不会每周期漏一个进程 |
 | `ipmitool` 根本不存在 | 报 `IpmitoolMissing`，与"BMC 超时"区分——这一类不会自愈，`check` 直接失败 |
@@ -221,8 +221,10 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 ## 6. 已知限制 / 后续可做
 
 - **没有 SIGHUP 热重载**：改配置需 `systemctl restart`（有意为之，配置错误时不会带着半套参数跑）。
-- **超时的子进程不 kill**：`ipmitool` 超时后辅助线程继续等它结束，极端情况下会多留一个进程；
-  换来的是不会误杀、不会死锁。要彻底解决需引入 `process-group` + `kill`。
+- **`command_timeout_seconds` 要按实测的 SDR 读取时间给**：BMC 读全表常常要 2～3 s（TYAN S8030
+  实测 2.9 s），默认 5 s 只留了不到 2 倍余量，给到 10 更稳。周期已经是"含本轮耗时的周期"，
+  但 SDR 读取时间超过 `interval_seconds` 时循环会变成连续采样，日志里会出现
+  "cycle overran the interval"。
 - **状态不落盘**：重启后从当前温度重新定档（升温路径本来就无防抖，不会因此过热）。
 - 引脚存在性只能启发式核对（见安全须知第 2 条）。
 - 若要支持多块板/多套策略：`platform.toml` 已经解耦，加个 `--platform` 切换即可。
@@ -239,8 +241,9 @@ cargo build --release            # 需要 GPU 支持
 cargo build --release --no-default-features   # 无 NVIDIA 驱动的机器
 ```
 
-- Edition 2021，声明 MSRV 1.75（依赖侧声明的 MSRV 都不高于它，对齐 Ubuntu 24.04 自带的 rustc；
-  本地实测构建用的是 1.96）。`Cargo.lock` 入库，保证部署可复现。
+- Edition 2021，`rust-version = "1.84"`。这个下限不是语言特性要求的，而是 `resolver = "3"`
+  （MSRV 感知的依赖解析）的下限：更老的 cargo 连 manifest 都读不进去。部署时用 rustup 的 stable
+  即可。`Cargo.lock` 入库，保证部署可复现。
 - `#![forbid(unsafe_code)]`；`[lints.clippy] all = "warn"`。
 - 所有需要硬件才能验证的东西都被推到边界：`ipmi::parse_sdr`、`curve`、`merge` 全是纯函数，
   测试不依赖 BMC、不依赖 GPU。

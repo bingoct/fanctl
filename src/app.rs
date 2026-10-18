@@ -141,7 +141,7 @@ fn check(cli: &Cli) -> ExitCode {
         .flat_map(|zone| zone.target_pins.iter().map(String::as_str))
         .collect();
     for (pin, id) in &platform.pins {
-        match find_fan_sensor(&index, pin) {
+        match find_fan_sensor(&entries, pin) {
             Some(name) => println!("[ ok ] pin `{pin}` ({id}) <- fan sensor `{name}`"),
             None => println!(
                 "[warn] pin `{pin}` ({id}): no fan sensor with a matching name; the id was only \
@@ -199,14 +199,89 @@ fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
     Engine::new(loaded, dry_run, shutdown).run()
 }
 
-/// Best effort: finds a fan sensor whose name contains the pin name.
+/// Best effort: finds a fan sensor whose name corresponds to the pin name.
 ///
 /// A pin id can only be verified for real by writing to it, which `check` must
 /// not do, so this only warns.
-fn find_fan_sensor(index: &HashMap<String, Option<f64>>, pin: &str) -> Option<String> {
+///
+/// Matching is strict on purpose. An exact name wins; a containment hit only
+/// counts when the character right after the match is not a digit, because
+/// otherwise the pin `SYS_FAN_1` "verifies" itself against the SDR entry
+/// `SYS_FAN_10` - a false `[ok]` in exactly the check that exists to catch a
+/// bad pin mapping. Ties resolve to the lexicographically first name so the
+/// report never depends on hash iteration order.
+fn find_fan_sensor<'a>(entries: &'a [ipmi::SdrEntry], pin: &str) -> Option<&'a str> {
     let wanted = sdr_key(pin);
-    index
-        .keys()
-        .find(|name| name.as_str().contains(wanted.as_str()))
-        .cloned()
+
+    if let Some(entry) = entries.iter().find(|entry| sdr_key(&entry.name) == wanted) {
+        return Some(&entry.name);
+    }
+
+    // Other boards decorate the header number (`FAN_CPU1`): accept a
+    // containment hit as long as it does not stop in the middle of a number.
+    entries
+        .iter()
+        .filter(|entry| {
+            let key = sdr_key(&entry.name);
+            key.match_indices(wanted.as_str())
+                .any(|(start, _)| !ends_mid_number(&key, start + wanted.len()))
+        })
+        .map(|entry| entry.name.as_str())
+        .min()
+}
+
+/// `true` when `name` continues with a digit at `offset`.
+///
+/// `offset` always sits on a character boundary: it is the end of a match.
+fn ends_mid_number(name: &str, offset: usize) -> bool {
+    name[offset..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ends_mid_number, find_fan_sensor};
+    use crate::sensors::ipmi::SdrEntry;
+
+    fn entries(names: &[&str]) -> Vec<SdrEntry> {
+        names
+            .iter()
+            .map(|name| SdrEntry {
+                name: (*name).to_string(),
+                celsius: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exact_pin_name_wins_over_a_longer_one() {
+        // The real reason this check exists: the TYAN S8030 exposes
+        // SYS_FAN_1 together with SYS_FAN_10..12 and only the first is wired.
+        let all = entries(&["SYS_FAN_10", "SYS_FAN_1", "SYS_FAN_11", "SYS_FAN_12"]);
+        assert_eq!(find_fan_sensor(&all, "SYS_FAN_1"), Some("SYS_FAN_1"));
+    }
+
+    #[test]
+    fn a_missing_pin_never_borrows_a_neighbours_name() {
+        let all = entries(&["SYS_FAN_10", "SYS_FAN_11"]);
+        assert_eq!(find_fan_sensor(&all, "SYS_FAN_1"), None);
+    }
+
+    #[test]
+    fn decorated_names_still_match() {
+        let all = entries(&["FAN_CPU1", "CPU_FAN_SPEED"]);
+        assert_eq!(find_fan_sensor(&all, "CPU_FAN"), Some("CPU_FAN_SPEED"));
+    }
+
+    #[test]
+    fn separators_and_case_are_ignored() {
+        let all = entries(&["cpu fan"]);
+        assert_eq!(find_fan_sensor(&all, "CPU_FAN"), Some("cpu fan"));
+    }
+
+    #[test]
+    fn a_digit_after_the_match_means_a_different_fan() {
+        assert!(ends_mid_number("sysfan10", "sysfan1".len()));
+        assert!(!ends_mid_number("sysfan1", "sysfan1".len()));
+        assert!(!ends_mid_number("sysfan1rpm", "sysfan1".len()));
+    }
 }
