@@ -5,7 +5,7 @@
 //! cannot be named there. Each one is a single line so there is still exactly
 //! one copy of the value.
 //!
-//! What is absent from this file is deliberate. Only four fields may be left
+//! What is absent from this file is deliberate. Only five fields may be left
 //! out and still need a value:
 //!
 //! | field | default |
@@ -14,13 +14,15 @@
 //! | `[global].command_timeout_seconds` | 10 |
 //! | `[global].debounce_celsius` | 2.0 |
 //! | `[global].aggregation` | `max` |
+//! | `[global].fallback_after_cycles` | 2 |
 //!
 //! Everything else is either required (`interval_seconds`, the duty cycle
 //! bounds, `cmd_template`, a sensor's `sdr` and `id`, ...), or inherits instead
 //! of defaulting (`[[zones]].aggregation`, `.default_duty_cycle`,
-//! `.debounce_celsius` read them from `[global]`). The bare `#[serde(default)]`
-//! uses in `policy.rs` are not defaults either: `Vec::new()` means "no rules",
-//! and `None` means "inherit".
+//! `.debounce_celsius`, `.fallback_duty_cycle`, `.fallback_after_cycles` read
+//! them from `[global]`). The bare `#[serde(default)]` uses in `policy.rs` are
+//! not defaults either: `Vec::new()` means "no rules", and `None` means
+//! "inherit".
 //!
 //! Only defaults belong here. Values that are not part of the configuration
 //! stay next to the code that uses them, and this table is the index:
@@ -60,4 +62,14 @@ pub(super) fn debounce_celsius() -> f64 {
 /// `[global].aggregation`: the highest reading wins.
 pub(super) fn aggregation() -> Aggregation {
     Aggregation::Max
+}
+
+/// `[global].fallback_after_cycles`.
+///
+/// Two cycles, not zero. A single failed `ipmitool exec` is common enough on a
+/// busy BMC, and jumping every fan to the blind value costs one audible step.
+/// Two cycles is 20 s at the default interval: long enough to ride out a hiccup,
+/// short enough that a sensor that stays dead does not hold the last duty.
+pub(super) fn fallback_after_cycles() -> u32 {
+    2
 }

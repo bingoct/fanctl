@@ -6,9 +6,10 @@
 目标环境：**Tyan S8030 + AMD EPYC 7413 + NVIDIA GPU**，Linux + systemd。
 硬件差异全部落在 `platform.toml`，控制逻辑里没有一处十六进制常量。
 
-当前状态：`cargo build` / `cargo test`（58 个测试）/ `cargo clippy --all-targets`（零告警）/
-`cargo fmt --check` 全部通过；控制循环已用假的 `ipmitool` 做过端到端验证。
-**尚未在真实 BMC 上跑过**，上机前务必先跑 `check` 与 `--dry-run`（见"安全须知"）。
+当前状态：`cargo build` / `cargo test`（Linux 上 102 个测试）/ `cargo clippy --all-targets`（零告警）/
+`cargo fmt --check` 全部通过。已在 TYAN S8030GM2NE 真机上完成 `check` → 5 分钟 `--dry-run` →
+10 分钟正式运行的验收（4 个分区、4 个引脚、SIGTERM 复位全部实测），并以 systemd 服务形式接管；
+上机流程见"安全须知"。
 
 ---
 
@@ -60,6 +61,7 @@ fanctl/
 │   ├── error.rs               # 两个错误枚举：Error / CommandError
 │   ├── logging.rs             # tracing → stdout（journald，无 ANSI），进程级配置一次
 │   ├── actuator.rs            # 唯一写主板的地方（渲染模板 + ipmitool）
+│   ├── bmc.rs                 # IPMI 批处理协议：脚本拼装 + 分隔符槽位解析（读/写共用）
 │   ├── app.rs                 # 子命令编排：check / run，信号注册
 │   ├── app/
 │   │   └── cli.rs             # clap 定义
@@ -124,7 +126,8 @@ fanctl/
 | `[global].interval_seconds` | 是 | — | 采样**周期**（≥1）。周期含本轮耗时，不是"跑完再睡这么久" |
 | `[global].min_duty_cycle` | 是 | — | 全局下限，1..=100 且 ≤ `max_duty_cycle`（不允许停转） |
 | `[global].max_duty_cycle` | 是 | — | 全局上限，≤100 |
-| `[global].fallback_duty_cycle` | 是 | — | **所有**传感器都读不到时的保底转速，必须落在 `min_duty_cycle..=max_duty_cycle` |
+| `[global].fallback_duty_cycle` | 是 | — | 分区读不到读数时的保底转速（分区可覆盖），必须落在 `min_duty_cycle..=max_duty_cycle` |
+| `[global].fallback_after_cycles` | 否 | `2` | 连续多少个周期没有读数才降保底档，≥1 |
 | `[global].default_duty_cycle` | 是 | — | 待机转速；分区省略时继承它。必须落在 `min_duty_cycle..=max_duty_cycle`，且不得高于本分区第一档 |
 | `[global].debounce_celsius` | 否 | `2.0` | 降档防抖（℃）；分区省略时继承它 |
 | `[global].aggregation` | 否 | `max` | 聚合方式；分区省略时继承它 |
@@ -140,6 +143,8 @@ fanctl/
 | `[[zones]].aggregation` | 否 | 继承 `[global]` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
 | `[[zones]].target_pins` | 是 | — | 非空，必须在 `[pins]` 里 |
 | `[[zones]].default_duty_cycle` | 否 | 继承 `[global]` | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
+| `[[zones]].fallback_duty_cycle` | 否 | 继承 `[global]` | 1..=100，且不得低于本分区的 `default_duty_cycle`；水泵这类"不能停"的执行器设成 100 |
+| `[[zones]].fallback_after_cycles` | 否 | 继承 `[global]` | ≥1；本分区连续多少个周期没有读数才降保底档 |
 | `[[zones]].debounce_celsius` | 否 | 继承 `[global]` | 单侧防抖（只作用于降档），≥0 且必须小于相邻阈值间隔 |
 | `[[zones]].thresholds` | 是，≥1 条 | — | 缺了在加载期报错 |
 | `[[zones.thresholds]].temperature` | 是 | — | 必须严格升序 |
@@ -150,15 +155,17 @@ fanctl/
 
 上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息，且由
 `tests/config_validation.rs::an_omitted_timeout_gets_the_documented_default` 钉住：
-只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius`、`aggregation`
-四个字段**可省略且有初值**；其余要么必填，要么是"继承 `[global]`"而不是取默认值
-（分区里的 `aggregation`、`default_duty_cycle`、`debounce_celsius` 属于后者）。
+只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius`、`aggregation`、
+`fallback_after_cycles` 五个字段**可省略且有初值**；其余要么必填，要么是"继承 `[global]`"
+而不是取默认值（分区里的 `aggregation`、`default_duty_cycle`、`debounce_celsius`、
+`fallback_duty_cycle`、`fallback_after_cycles` 属于后者）。
 运行期调参（子进程轮询退避、关停轮询间隔、温度合理性区间）不在这个文件里，
 `defaults.rs` 文件头有一张指路表指向它们的实际位置。
 
-`aggregation`、`default_duty_cycle`、`debounce_celsius` 在 `[global]` 里是**共享策略**：
-分区不写就继承，写了就覆盖。继承在加载时一次性展开（`FanConfig::from_raw`），
-运行期每个分区拿到的都是确定值，不存在"空值再去看全局"的分支。
+`aggregation`、`default_duty_cycle`、`debounce_celsius`、`fallback_duty_cycle`、
+`fallback_after_cycles` 在 `[global]` 里是**共享策略**：分区不写就继承，写了就覆盖。
+继承在加载时一次性展开（`FanConfig::from_raw`），运行期每个分区拿到的都是确定值，
+不存在"空值再去看全局"的分支。
 
 **名字一律大小写不敏感。** `cpu_fan`、`CPU_FAN`、`Cpu_Fan` 是同一个引脚，
 `"gpu"` 与 `"GPU"` 等价，`"gpu1"` 与 `"GPU1"` 等价。加载时会把 `config.toml` 里的引用统一改写成
@@ -171,8 +178,9 @@ fanctl/
 TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于相邻阈值间隔 →
 引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
 `min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` →
-`fallback_duty_cycle` 不低于任何分区的待机档（失去全部读数不该比"测到很凉"更安静）→
-待机档在窗口内且不高于第一档 → 名字大小写冲突 → `[sensors]` 不得占用 `GPU` / `GPU<n>`。
+**每个分区**的 `fallback_duty_cycle` 不低于它自己的待机档（读不到读数不该比"测到很凉"更安静）→
+`fallback_after_cycles ≥ 1` → 待机档在窗口内且不高于第一档 → 名字大小写冲突 →
+`[sensors]` 不得占用 `GPU` / `GPU<n>`。
 `GPU<n>` 的编号是否存在要连上驱动才知道，属于运行期事实：`check` 会把实际枚举到的
 `GPU0..n` 打出来，编号写错时那个分区会走"无读数"路径（保持上一档并告警），不会 panic。
 
@@ -227,7 +235,41 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 没有任何分区引用 `GPU` 时，连 NVML 都不会打开（否则一个纯 CPU 的机器会每 10 秒
 重试一次 `dlopen("libnvidia-ml.so")`）。
 
-### 4.2 非对称防抖（快升慢降）
+### 4.2 批量下发 PWM
+
+写和读走同一套机制。每周期需要改动的引脚（过滤掉"和上次成功下发值相同"的那些）
+合并成**一个** `ipmitool exec` 进程：
+
+```text
+raw 0x06 0x01                                   # 分隔符
+raw 0x2e 0x44 0xfd 0x19 0x00 0xNN 0x01 0xPP      # 通道 NN ← PP%
+raw 0x06 0x01
+raw 0x2e 0x44 0xfd 0x19 0x00 0xNN 0x01 0xPP
+...
+```
+
+| 写法 | 4 个引脚 |
+|---|---|
+| 逐个 `ipmitool raw` | 356 ms |
+| **一次 `exec`（现在用的）** | **125 ms** |
+
+（TYAN S8030 / ipmitool 1.8.19 实测；单条 `raw` 进程启动就要 90 ms，批量的固定开销 ≈40 ms、
+每个事务 ≈17 ms，所以引脚越多省得越多。）
+
+**成功与否看每条命令的应答，不看 `ipmitool` 的退出码。** 写命令成功时回 `fd 19 00`
+（3 字节 ACK），失败时什么都不打印、只在 stderr 留一行；`exec` 遇到失败仍会继续跑后面的命令，
+但整体退出码是 1。因此：
+
+- 槽位非空 = 该引脚确认下发；槽位为空 = 该引脚失败；
+- 整体 `rc != 0` 但有 ACK 的引脚**照样算成功**（换个角度看，rc 只是"至少一条失败"的标志）；
+- 所有槽位都空 = 整批失败（超时、BMC 拒绝、脚本都没跑起来），`Error` 返回，不更新任何"已下发值"；
+- 只有确认成功的引脚才更新"已下发值"，失败的引脚下个周期会重发——
+  不会出现"以为写进去了、其实没有，于是再也不重试"。
+
+槽位协议与读取完全一致（`src/bmc.rs`，读写在两个模块间共用），所以逐引脚的失败归因是免费的，
+不需要为了"哪一把扇子写失败"再单独发一次命令。`--dry-run` 时整批只记日志，不开进程。
+
+### 4.3 非对称防抖（快升慢降）
 不引入滑动滤波，只用单侧迟滞，档位 `n` 对应第 `n` 个阈值：
 
 | 方向 | 条件 | 动作 |
@@ -247,23 +289,30 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 BMC 自己的风扇策略（或换扇），fanctl 无法让一把扇子低于它自己的最低转速。
 反过来说，按 30 % 待机是"物理上最安静"的选择，不必再往低调。
 
-### 4.3 合并与兜底（顺序固定）
+### 4.4 合并与兜底（顺序固定）
 1. 各分区算出目标引脚 → **同一引脚取最大值**（绝不覆盖降速）；
 2. `follows` 求不动点（与声明顺序无关）→ `Pwm(A) = max(Pwm(A), Pwm(B))`；
 3. 夹到 `[min_duty_cycle, max_duty_cycle]`；
-4. 只对"与上次成功下发值不同"的引脚发指令（BMC 不会被每 10 秒刷一遍）。
+4. 只对"与上次**确认**下发值不同"的引脚发指令（BMC 不会被每 10 秒刷一遍），
+   整批发一次 `exec`（见 4.2）。
 
-### 4.4 失败策略
+### 4.5 失败策略
 
 | 情况 | 反应 |
 |------|------|
-| 某个分区读不到数据 | 保持该分区上一次的转速（不降速） |
-| 该分区从没读到过数据 | 用 `fallback_duty_cycle` |
-| 一个传感器都读不到 | 所有**被分区驱动**的引脚 → `fallback_duty_cycle`（没人管的引脚不碰，理由同退出复位） |
-| `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出、不更新"已下发值" |
+| 某个分区读不到数据，且未超过宽限 | 保持该引脚上一次的转速（不降速） |
+| 该分区连续 `fallback_after_cycles` 个周期都没有任何读数 | 该分区所有引脚 → **本分区的** `fallback_duty_cycle` |
+| 该分区从没读到过数据（刚启动） | 直接 `fallback_duty_cycle`，不等宽限 |
+| 一个传感器都读不到（`snapshot` 为空） | 跳过宽限，所有**被分区驱动**的引脚立即 → 各自分区的 `fallback_duty_cycle`（没人管的引脚不碰，理由同退出复位） |
+| `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出；未确认的引脚不更新"已下发值" |
 | BMC 挂住不回 | 单次调用有超时；超时后**杀掉并回收子进程**（连同两个读管道的线程），循环不会被卡死，也不会每周期漏一个进程 |
 | `ipmitool` 根本不存在 | 报 `IpmitoolMissing`，与"BMC 超时"区分——这一类不会自愈，`check` 直接失败 |
-| SIGINT / SIGTERM | 每个被驱动的引脚 → 所属分区 `default_duty_cycle`，然后退出 0 |
+| SIGINT / SIGTERM | 每个被驱动的引脚 → 所属分区 `default_duty_cycle`（整批一次 `exec`），然后退出 0 |
+
+宽限的意义是"抖一下不至于改转速"：BMC 偶发一次没回，风扇不该立刻从中档爬到兜底档再爬回来。
+`fallback_after_cycles = 2` 配 10 s 周期，等于连续 20 s 完全没数据才降档。
+水泵这类"读不到也必须满转"的设备用分区覆盖解决——`fallback_duty_cycle = 100` 与
+`default_duty_cycle = 100` 相同，宽限和兜底都不改变它的输出。
 
 ---
 
@@ -279,8 +328,10 @@ BMC 自己的风扇策略（或换扇），fanctl 无法让一把扇子低于它
 4. 进程退出时 BMC 保留最后一次写入的值，所以 `SIGTERM` 会把每个被驱动的引脚写回
    所属分区的 `default_duty_cycle`；**没有任何分区驱动的引脚不会被碰**（daemon 从没写过它，
    退出时也不该凭空塞一个值，`check` 会给出 `[warn]`）。
-   `TimeoutStopSec` 必须覆盖最坏情况 `(1 + 2N) × command_timeout_seconds`（N = 被驱动的引脚数：
-   退出时可能还有一轮在跑的读 + N 次写，加上复位 N 次写），否则 systemd 会在优雅退出做到一半时 SIGKILL。
+   `TimeoutStopSec` 必须覆盖最坏情况 **`3 × command_timeout_seconds`**：收到信号时可能还有
+   一轮在跑的读（1×）+ 这一轮的批量写（1×），加上退出复位的那一批写（1×）。
+   批量写让这一项**不再随引脚数增长**（以前是 `(1 + 2N) ×`）；10 s 默认值下 30 s 足够，
+   `packaging/fanctl.service` 里给的 120 s 有充足余量。
 5. `ipmitool` 需要 root（或 udev 规则 + `CAP_SYS_RAWIO`）；unit 里刻意**没有**加
    `PrivateDevices=yes` 这类会屏蔽 `/dev/ipmi*` 的选项。
 6. BIOS 里若把风扇策略设成 "Full Speed" 或某些 BMC 会在重启后重置 PWM，

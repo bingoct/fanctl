@@ -19,23 +19,16 @@
 //! single `ipmitool exec` process - measured at 105 ms for one sensor and
 //! 155 ms for five.
 
-use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use crate::bmc;
 use crate::error::Error;
 use crate::util::process::{run_capturing_with_stdin, run_checked};
 
-/// `raw 0x06 0x01` is Get Device ID: it always prints 15 bytes, which makes it
-/// a separator the BMC cannot skip.
-const SEPARATOR_COMMAND: &str = "raw 0x06 0x01";
-/// Number of bytes a Get Device ID response prints.
-const SEPARATOR_BYTES: usize = 15;
 /// `byte 2`, bit 5 of a Get Sensor Reading response: reading unavailable.
 const READING_UNAVAILABLE: u8 = 0x20;
-/// Where `ipmitool exec` reads its command list from.
-const SCRIPT_PATH: &str = "/dev/stdin";
 
 /// One line of `ipmitool sdr`.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,18 +130,15 @@ pub struct SensorBatch {
 
 /// Builds the command list a batched read feeds to `ipmitool exec`.
 ///
-/// The numbers never change after startup, so the hub builds this once and
-/// reuses it: the control loop does no formatting and no allocation here.
+/// The sensor numbers never change after startup, so the hub builds this once
+/// and reuses it: the control loop does no formatting and no allocation here.
 pub fn build_script(numbers: &[u8]) -> String {
-    // Roughly 40 bytes per command.
-    let mut script = String::with_capacity(numbers.len() * 48);
-    for number in numbers {
-        script.push_str(SEPARATOR_COMMAND);
-        script.push('\n');
-        // netfn 0x04 = sensor/event, command 0x2d = Get Sensor Reading.
-        let _ = writeln!(script, "raw 0x04 0x2d 0x{number:02x}");
-    }
-    script
+    // netfn 0x04 = sensor/event, command 0x2d = Get Sensor Reading.
+    bmc::script(
+        numbers
+            .iter()
+            .map(|number| format!("raw 0x04 0x2d 0x{number:02x}")),
+    )
 }
 
 /// Reads every sensor in `script` with a single `ipmitool exec` process.
@@ -174,7 +164,7 @@ pub fn read_sensors(
     }
 
     let mut command = Command::new(ipmitool);
-    command.args(["exec", SCRIPT_PATH]);
+    command.args(["exec", bmc::SCRIPT_PATH]);
 
     let output = run_capturing_with_stdin(command, script.as_bytes(), timeout).map_err(|err| {
         if err.is_missing_program() {
@@ -205,45 +195,16 @@ pub fn read_sensors(
 /// that slot. Two separators in a row therefore mean "that read produced
 /// nothing", not "the following readings moved up one".
 pub(crate) fn parse_batch(text: &str, expected: usize) -> Vec<Option<f64>> {
-    let mut values = vec![None; expected];
-    let mut filled = vec![false; expected];
-    let mut slot: Option<usize> = None;
-
-    for line in text.lines() {
-        // Walked as an iterator rather than collected into a Vec: this runs
-        // twice per sensor, every cycle, and the token count is all that is
-        // needed to tell a separator from a reading.
-        let mut tokens = line.split_whitespace();
-        let Some(first) = tokens.next() else {
-            continue;
-        };
-        let second = tokens.next();
-        let length = if second.is_some() {
-            2 + tokens.count()
-        } else {
-            1
-        };
-
-        if length == SEPARATOR_BYTES {
-            slot = Some(match slot {
-                Some(index) => index + 1,
-                None => 0,
-            });
-            continue;
-        }
-
-        // Anything before the first separator is not a reading we asked for.
-        if let Some(index) = slot {
-            if index < expected && !filled[index] {
-                if let Some(status) = second {
-                    values[index] = parse_sensor_reading(first, status);
-                }
-                filled[index] = true;
-            }
-        }
-    }
-
-    values
+    bmc::split_slots(text, expected)
+        .into_iter()
+        .map(|slot| {
+            let slot = slot?;
+            let mut tokens = slot.split_whitespace();
+            let reading = tokens.next()?;
+            let status = tokens.next()?;
+            parse_sensor_reading(reading, status)
+        })
+        .collect()
 }
 
 /// Decodes a Get Sensor Reading response into degrees Celsius.

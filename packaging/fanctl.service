@@ -35,11 +35,13 @@ RestrictSUIDSGID=yes
 # never leaves the fans at the last hot-cycle setting. Pins no zone drives are
 # not touched.
 #
-# TimeoutStopSec must cover the worst case, not one call: the cycle in flight
-# may be reading sensors (1 x command_timeout_seconds) and writing several pins
-# (N x command_timeout_seconds), and the shutdown path then writes N pins again.
-# That is (1 + 2N) x command_timeout_seconds. With the 10 s default this covers
-# up to five pins; add 20 s per extra pin on a bigger board.
+# TimeoutStopSec must cover the worst case, not one call. When SIGTERM arrives
+# the cycle in flight may still be reading sensors (1 x command_timeout_seconds)
+# and then writing its batch (1 x command_timeout_seconds), and the shutdown
+# path writes every pin again in a single batch (1 x command_timeout_seconds).
+# That is 3 x command_timeout_seconds, independent of the pin count: writes are
+# batched into one ipmitool exec, so a bigger board does not need a bigger
+# timeout. The 10 s default gives 30 s; 120 s leaves plenty of headroom.
 KillSignal=SIGTERM
 
 [Install]

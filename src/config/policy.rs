@@ -37,10 +37,18 @@ pub struct GlobalSettings {
     /// Duty cycle used when *nothing* can be read - the blind value.
     ///
     /// Not the same question as `default_duty_cycle`, which means "the readings
-    /// are fine and the machine is cool". Blind is not cool: if the BMC stops
-    /// answering, the fans must not settle at the quietest setting, so this
-    /// value is validated to be at least as fast as every zone's standby.
+    /// are fine and the machine is cool". Blind is not cool, so this is normally
+    /// faster than standby. It is also the value a zone inherits when it does not
+    /// set its own, and validation keeps every zone at or above its own standby.
     pub fallback_duty_cycle: u8,
+    /// How many cycles a zone may go without a reading before it drops to
+    /// `fallback_duty_cycle`, inherited by zones that do not set their own.
+    ///
+    /// Measured in cycles rather than seconds on purpose: the unit of the thing
+    /// being counted is the loop, and `interval_seconds` is already the knob for
+    /// how long a cycle lasts.
+    #[serde(default = "super::defaults::fallback_after_cycles")]
+    pub fallback_after_cycles: u32,
     /// Deadline for a single `ipmitool` invocation.
     #[serde(default = "super::defaults::command_timeout_seconds")]
     pub command_timeout_seconds: u64,
@@ -90,6 +98,12 @@ pub struct RawZone {
     /// Duty cycle while the temperature stays below the first threshold.
     #[serde(default)]
     pub default_duty_cycle: Option<u8>,
+    /// Duty cycle used when this zone has had no reading for too long.
+    #[serde(default)]
+    pub fallback_duty_cycle: Option<u8>,
+    /// Cycles without a reading tolerated before using `fallback_duty_cycle`.
+    #[serde(default)]
+    pub fallback_after_cycles: Option<u32>,
     /// Single sided hysteresis in degrees Celsius, applied on the way *down*.
     #[serde(default)]
     pub debounce_celsius: Option<f64>,
@@ -112,6 +126,10 @@ pub struct ZoneConfig {
     pub target_pins: Vec<String>,
     /// Duty cycle while the temperature stays below the first threshold.
     pub default_duty_cycle: u8,
+    /// Duty cycle used when this zone has had no reading for too long.
+    pub fallback_duty_cycle: u8,
+    /// Cycles without a reading tolerated before using `fallback_duty_cycle`.
+    pub fallback_after_cycles: u32,
     /// Single sided hysteresis in degrees Celsius, applied on the way *down*.
     pub debounce_celsius: f64,
     /// Curve breakpoints, must be sorted by ascending temperature.
@@ -179,6 +197,12 @@ impl FanConfig {
                 aggregation: zone.aggregation.unwrap_or(global.aggregation),
                 target_pins: zone.target_pins,
                 default_duty_cycle: zone.default_duty_cycle.unwrap_or(global.default_duty_cycle),
+                fallback_duty_cycle: zone
+                    .fallback_duty_cycle
+                    .unwrap_or(global.fallback_duty_cycle),
+                fallback_after_cycles: zone
+                    .fallback_after_cycles
+                    .unwrap_or(global.fallback_after_cycles),
                 debounce_celsius: zone.debounce_celsius.unwrap_or(global.debounce_celsius),
                 thresholds: zone.thresholds,
             })
@@ -236,27 +260,39 @@ impl FanConfig {
         problems
     }
 
-    /// `fallback_duty_cycle` must not be slower than the loudest standby.
+    /// Every zone's blind value must be at least as fast as its own standby.
     ///
-    /// Both values answer "what do we do without a temperature", but they
-    /// answer different questions: standby means "measured, and it is cool",
-    /// fallback means "we cannot measure anything at all". Losing every sensor
-    /// must never be quieter than a healthy idle, otherwise a dead BMC would
-    /// silently become the quietest state the machine has.
+    /// Both values answer "what do we do without a temperature", but they answer
+    /// different questions: standby means "measured, and it is cool", fallback
+    /// means "this zone has had no reading for `fallback_after_cycles` cycles".
+    /// Being blind must never be quieter than a healthy idle, otherwise a dead
+    /// BMC silently becomes the quietest state the machine has.
+    ///
+    /// Zone by zone, not across all zones: a water pump sits at 100 % in both
+    /// states, and comparing that against a case fan's mid fallback would reject
+    /// a perfectly healthy configuration.
     fn validate_fallback(&self, problems: &mut Vec<String>) {
-        let loudest_standby = self
-            .zones
-            .iter()
-            .map(|zone| zone.default_duty_cycle)
-            .max()
-            .unwrap_or(0);
-        if self.global.fallback_duty_cycle < loudest_standby {
-            problems.push(format!(
-                "[global].fallback_duty_cycle ({}) must not be lower than the standby duty cycle \
-                 of the loudest zone ({}): with no readings at all the fans must not spin slower \
-                 than they do at room temperature",
-                self.global.fallback_duty_cycle, loudest_standby
-            ));
+        for zone in &self.zones {
+            if zone.fallback_duty_cycle < zone.default_duty_cycle {
+                problems.push(format!(
+                    "zone `{}`: fallback_duty_cycle ({}) must not be lower than \
+                     default_duty_cycle ({}): with no readings the fans must not spin slower \
+                     than they do at room temperature",
+                    zone.name, zone.fallback_duty_cycle, zone.default_duty_cycle
+                ));
+            }
+            if zone.fallback_duty_cycle < self.global.min_duty_cycle
+                || zone.fallback_duty_cycle > self.global.max_duty_cycle
+            {
+                problems.push(format!(
+                    "zone `{}`: fallback_duty_cycle ({}) must be within \
+                     min_duty_cycle..=max_duty_cycle ({}..={})",
+                    zone.name,
+                    zone.fallback_duty_cycle,
+                    self.global.min_duty_cycle,
+                    self.global.max_duty_cycle
+                ));
+            }
         }
     }
 
@@ -267,6 +303,13 @@ impl FanConfig {
         }
         if global.command_timeout_seconds == 0 {
             problems.push("[global].command_timeout_seconds must be at least 1".to_string());
+        }
+        if global.fallback_after_cycles == 0 {
+            problems.push(
+                "[global].fallback_after_cycles must be at least 1: a zero grace period would \
+                 drop the fans to the blind duty cycle on a single failed read"
+                    .to_string(),
+            );
         }
         if global.min_duty_cycle < DUTY_MIN {
             problems.push(format!(
@@ -357,6 +400,12 @@ impl FanConfig {
                 problems.push(format!(
                     "{label}: default_duty_cycle ({}) must be within {DUTY_MIN}..={DUTY_MAX}",
                     zone.default_duty_cycle
+                ));
+            }
+            if zone.fallback_after_cycles == 0 {
+                problems.push(format!(
+                    "{label}: fallback_after_cycles must be at least 1: a zero grace period \
+                     would drop the fans to the blind duty cycle on a single failed read"
                 ));
             }
             if zone.debounce_celsius < 0.0 {

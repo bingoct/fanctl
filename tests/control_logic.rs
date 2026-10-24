@@ -11,6 +11,8 @@ fn zone_with(sources: &[&str], aggregation: Aggregation) -> ZoneConfig {
         aggregation,
         target_pins: vec!["CPU_FAN".to_string()],
         default_duty_cycle: 30,
+        fallback_duty_cycle: 60,
+        fallback_after_cycles: 2,
         debounce_celsius: 2.0,
         thresholds: vec![
             Threshold {

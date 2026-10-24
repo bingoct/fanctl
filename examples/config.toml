@@ -8,14 +8,21 @@
 interval_seconds = 10        # sampling period (seconds)
 min_duty_cycle = 25          # hard floor, fans never stop
 max_duty_cycle = 100         # hard ceiling
-fallback_duty_cycle = 60     # used when no sensor can be read at all
+fallback_duty_cycle = 60     # used when a zone cannot read its sensors at all
 
-# The three keys below are the shared policy: a zone that omits any of them
+# The keys below are the shared policy: a zone that omits any of them
 # inherits the value written here. Repeat a key inside a zone to override it.
 default_duty_cycle = 30      # standby, below the first threshold
 debounce_celsius = 2         # hysteresis applied only when dropping a step
 aggregation = "max"          # max or mean
+fallback_after_cycles = 2    # cycles without a reading before falling back
 # command_timeout_seconds = 10 # deadline for one ipmitool invocation (default 10)
+
+# A zone may also override the blind value itself. A water pump is the case that
+# matters: it must keep running when the BMC stops answering.
+#   default_duty_cycle = 100
+#   fallback_duty_cycle = 100
+#   fallback_after_cycles = 1
 
 # On SIGINT/SIGTERM each pin is set back to its zone's default_duty_cycle, so
 # the BMC does not keep the last (possibly 100 %) value. Pins no zone drives

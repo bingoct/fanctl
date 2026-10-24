@@ -27,6 +27,12 @@ fn load_error(policy: &str) -> String {
     load_error_with_platform(PLATFORM, policy)
 }
 
+/// Loads `policy` against the example platform, panicking on any error.
+fn load(policy: &str) -> LoadedConfig {
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, policy);
+    LoadedConfig::load(&policy_path, &platform_path).expect("configuration must load")
+}
+
 /// Loads `policy` against a custom platform, returning the error text.
 fn load_error_with_platform(platform: &str, policy: &str) -> String {
     let (_dir, policy_path, platform_path) = fixture(platform, policy);
@@ -401,14 +407,55 @@ fn a_global_standby_step_outside_the_window_is_rejected() {
 
 #[test]
 fn a_blind_fallback_must_not_be_quieter_than_standby() {
-    // `fallback_duty_cycle` belongs to "no readings at all", `default_duty_cycle`
-    // to "readings are fine and it is cool". If losing every sensor produced the
+    // `fallback_duty_cycle` belongs to "no readings", `default_duty_cycle` to
+    // "readings are fine and it is cool". If losing the sensor produced the
     // quietest state the machine has, a dead BMC would be silent and invisible.
+    // The rule is applied per zone, so the message names the zone.
     let policy =
         policy_with(ASCENDING, 2.0).replace("fallback_duty_cycle = 60", "fallback_duty_cycle = 25");
     let error = load_error(&policy);
     assert!(
-        error.contains("fallback_duty_cycle") && error.contains("loudest zone"),
+        error.contains("zone `cpu_zone`") && error.contains("fallback_duty_cycle (25)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_zone_may_override_the_blind_fallback() {
+    // The pump case: 100 % standby and 100 % blind, while every other zone keeps
+    // the global mid fallback. This is exactly what the old global rule rejected.
+    let policy = format!(
+        "{}{}",
+        policy_with(ASCENDING, 2.0),
+        r#"
+[[zones]]
+name = "pump"
+monitor_sources = ["CPU_Tctl"]
+target_pins = ["SYS_FAN_2"]
+default_duty_cycle = 100
+fallback_duty_cycle = 100
+fallback_after_cycles = 1
+
+[[zones.thresholds]]
+temperature = 0
+duty_cycle = 100
+"#
+    );
+    let loaded = load(&policy);
+    assert_eq!(loaded.policy.zones.len(), 2);
+    assert_eq!(loaded.policy.zones[0].fallback_duty_cycle, 60);
+    assert_eq!(loaded.policy.zones[0].fallback_after_cycles, 2);
+    assert_eq!(loaded.policy.zones[1].fallback_duty_cycle, 100);
+    assert_eq!(loaded.policy.zones[1].fallback_after_cycles, 1);
+}
+
+#[test]
+fn a_zero_grace_period_is_rejected() {
+    let policy =
+        policy_with(ASCENDING, 2.0).replace("[global]", "[global]\nfallback_after_cycles = 0");
+    let error = load_error(&policy);
+    assert!(
+        error.contains("fallback_after_cycles must be at least 1"),
         "unexpected error: {error}"
     );
 }

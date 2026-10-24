@@ -86,7 +86,8 @@ fn check(cli: &Cli) -> ExitCode {
 
     for zone in &loaded.policy.zones {
         println!(
-            "[ ok ] zone `{}`: [{}] {} -> [{}], standby {}%, debounce {} C, {} threshold(s)",
+            "[ ok ] zone `{}`: [{}] {} -> [{}], standby {}%, fallback {}% after {} cycle(s), \
+             debounce {} C, {} threshold(s)",
             zone.name,
             zone.sources
                 .iter()
@@ -96,6 +97,8 @@ fn check(cli: &Cli) -> ExitCode {
             zone.aggregation.as_str(),
             zone.target_pins.join(", "),
             zone.default_duty_cycle,
+            zone.fallback_duty_cycle,
+            zone.fallback_after_cycles,
             zone.debounce_celsius,
             zone.thresholds.len()
         );

@@ -123,9 +123,27 @@ pub fn standby_targets(zones: &[ZoneConfig], min: u8, max: u8) -> TargetMap {
     targets
 }
 
+/// Blind duty cycle of every pin the daemon drives.
+///
+/// Each pin falls back to its zone's `fallback_duty_cycle` - the value used when
+/// that zone has had no reading for `fallback_after_cycles` cycles, which is a
+/// different question from standby. A pin driven by several zones takes the
+/// highest one, matching the conflict rule above. Pins that no zone drives are
+/// absent on purpose: the daemon never wrote them.
+pub fn fallback_targets(zones: &[ZoneConfig], min: u8, max: u8) -> TargetMap {
+    let mut targets = TargetMap::new();
+    for zone in zones {
+        for pin in &zone.target_pins {
+            targets.raise(pin, zone.fallback_duty_cycle);
+        }
+    }
+    targets.clamp(min, max);
+    targets
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{standby_targets, TargetMap};
+    use super::{fallback_targets, standby_targets, TargetMap};
     use crate::config::{Aggregation, FollowRule, ZoneConfig};
     use crate::sensors::Source;
 
@@ -143,6 +161,8 @@ mod tests {
             aggregation: Aggregation::Max,
             target_pins: vec![pin.to_string()],
             default_duty_cycle,
+            fallback_duty_cycle: 60,
+            fallback_after_cycles: 2,
             debounce_celsius: 2.0,
             thresholds: Vec::new(),
         }
@@ -237,5 +257,36 @@ mod tests {
     fn standby_respects_the_global_floor() {
         let zones = vec![zone("a", "CPU_FAN", 10)];
         assert_eq!(standby_targets(&zones, 25, 100).get("CPU_FAN"), Some(25));
+    }
+
+    #[test]
+    fn fallback_uses_the_zone_value_not_the_standby() {
+        // The helper's zones stand at 30 % but fall back to 60 %: blind is not
+        // the same state as cool.
+        let zones = vec![zone("a", "CPU_FAN", 30)];
+        assert_eq!(fallback_targets(&zones, 25, 100).get("CPU_FAN"), Some(60));
+    }
+
+    #[test]
+    fn fallback_takes_the_highest_value_on_a_shared_pin() {
+        let mut pump = zone("pump", "CPU_FAN", 100);
+        pump.fallback_duty_cycle = 100;
+        let quiet = zone("quiet", "CPU_FAN", 30);
+        assert_eq!(
+            fallback_targets(&[pump, quiet], 25, 100).get("CPU_FAN"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn fallback_respects_the_global_ceiling() {
+        let zones = vec![zone("a", "CPU_FAN", 30)];
+        assert_eq!(fallback_targets(&zones, 25, 50).get("CPU_FAN"), Some(50));
+    }
+
+    #[test]
+    fn fallback_skips_pins_no_zone_drives() {
+        let zones = vec![zone("a", "CPU_FAN", 30)];
+        assert_eq!(fallback_targets(&zones, 25, 100).get("SYS_FAN_1"), None);
     }
 }

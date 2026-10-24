@@ -20,10 +20,14 @@
 //! Four files sit at the root because they are spoken by every layer or by
 //! `main` directly: [`error`] (the shared vocabulary), [`actuator`] (the only
 //! writer of the BMC), [`logging`] (process-wide subscriber setup) and the
-//! usual `main` / `lib` pair. Everything else lives in one of five directories
-//! grouped by concern: [`app`], [`config`], [`sensors`], [`control`], [`util`].
+//! usual `main` / `lib` pair. `bmc` sits next to them as internal plumbing: the
+//! separator-and-slot protocol shared by the reading and the writing side.
+//! Everything else lives in one of five directories grouped by concern: [`app`],
+//! [`config`], [`sensors`], [`control`], [`util`].
 
 #![forbid(unsafe_code)]
+
+mod bmc;
 
 pub mod actuator;
 pub mod app;
