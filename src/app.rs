@@ -262,8 +262,11 @@ fn check(cli: &Cli) -> ExitCode {
     let mut monitor = gpu::GpuMonitor::new();
     match monitor.read() {
         Ok(readings) => {
-            for (name, celsius) in readings {
-                println!("[ ok ] GPU `{name}` = {celsius} C");
+            // The index is printed because `monitor_sources` addresses cards by
+            // it (`GPU0`, `GPU1`, ...); the model name alone cannot tell two
+            // identical cards apart.
+            for (index, name, celsius) in readings {
+                println!("[ ok ] GPU{index} `{name}` = {celsius} C");
             }
         }
         Err(err) => println!("[warn] GPU: {err}"),
@@ -301,6 +304,11 @@ fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
         )));
     }
 
+    // A wrong GPU index is not fatal - the driver may come up after `fanctl`,
+    // and a zone without a reading holds its previous duty cycle - but it must
+    // not be silent: without this line the zone simply never reacts.
+    warn_unknown_gpu_indices(&loaded);
+
     info!(
         board = %loaded.platform.info.name,
         zones = loaded.policy.zones.len(),
@@ -318,6 +326,45 @@ fn run_daemon(cli: &Cli, dry_run: bool) -> Result<(), Error> {
     }
 
     Engine::new(loaded, dry_run, shutdown).run()
+}
+
+/// Warns when `monitor_sources` names a GPU index NVML does not report.
+///
+/// The index is a runtime fact: a card can be pulled, and two identical cards
+/// are indistinguishable by name, so this cannot be validated against the TOML
+/// files. It is a warning rather than an error because NVML may legitimately be
+/// unavailable at startup (driver loaded later, `gpu` feature disabled).
+fn warn_unknown_gpu_indices(loaded: &LoadedConfig) {
+    let wanted: HashSet<u32> = loaded
+        .policy
+        .zones
+        .iter()
+        .flat_map(|zone| zone.sources.iter())
+        .filter_map(|source| match source {
+            Source::Gpu(Some(index)) => Some(*index),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    let mut monitor = gpu::GpuMonitor::new();
+    match monitor.read() {
+        Ok(devices) => {
+            for index in wanted {
+                if !devices.iter().any(|(seen, _, _)| *seen == index) {
+                    warn!(
+                        gpu = index,
+                        present = devices.len(),
+                        "monitor_sources references a GPU index NVML did not report; that zone \
+                         will keep running without a reading"
+                    );
+                }
+            }
+        }
+        Err(err) => warn!(error = %err, "cannot verify GPU indices at startup"),
+    }
 }
 
 /// Confirms every configured sensor number belongs to the name written next to

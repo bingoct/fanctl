@@ -40,7 +40,7 @@ fn snapshot(cpu: Option<f64>, mosfet: Option<f64>, gpus: &[f64]) -> SensorSnapsh
     snapshot.gpus = gpus
         .iter()
         .enumerate()
-        .map(|(index, celsius)| (format!("GPU{index}"), *celsius))
+        .map(|(index, celsius)| (index as u32, format!("GPU{index}"), *celsius))
         .collect();
     snapshot
 }
@@ -76,6 +76,25 @@ fn hot_gpu_drives_the_intake_zone() {
     let state = next_band(&zone, Some(ZoneState { band: 0 }), temperature);
     assert_eq!(state.band, 2);
     assert_eq!(duty_for_band(&zone, state.band), 60);
+}
+
+#[test]
+fn indexed_gpu_source_reads_only_that_card() {
+    // Three cards, the middle one is the coolest: `GPU1` must report 45, not
+    // the 80 that the folded `GPU` source would pick.
+    let indexed = zone_with(&["GPU1"], Aggregation::Max);
+    let folded = zone_with(&["GPU"], Aggregation::Max);
+    let readings = snapshot(None, None, &[80.0, 45.0, 50.0]);
+
+    assert_eq!(aggregate(&indexed, &readings), Some(45.0));
+    assert_eq!(aggregate(&folded, &readings), Some(80.0));
+}
+
+#[test]
+fn indexed_gpu_source_yields_nothing_when_the_card_is_absent() {
+    let zone = zone_with(&["GPU3"], Aggregation::Max);
+    let readings = snapshot(None, None, &[80.0, 45.0]);
+    assert_eq!(aggregate(&zone, &readings), None);
 }
 
 #[test]

@@ -6,6 +6,18 @@
 
 use thiserror::Error;
 
+/// Library names tried in order when NVML is first needed.
+///
+/// `nvml-wrapper` defaults to the unversioned `libnvidia-ml.so`, which only
+/// exists when the driver's development package is installed. Debian and
+/// Ubuntu ship just the SONAME `libnvidia-ml.so.1`, so a stock host would
+/// otherwise be unable to read any GPU temperature.
+#[cfg(target_os = "linux")]
+const NVML_LIB_PATHS: &[&str] = &["libnvidia-ml.so", "libnvidia-ml.so.1"];
+/// Same idea for Windows, where the driver installs `nvml.dll`.
+#[cfg(not(target_os = "linux"))]
+const NVML_LIB_PATHS: &[&str] = &["nvml.dll", "libnvidia-ml.so"];
+
 /// Why no GPU reading could be produced.
 #[derive(Debug, Error)]
 pub enum GpuError {
@@ -22,9 +34,11 @@ pub enum GpuError {
 
 #[cfg(feature = "gpu")]
 mod imp {
+    use std::ffi::OsStr;
+
     use tracing::debug;
 
-    use super::GpuError;
+    use super::{GpuError, NVML_LIB_PATHS};
 
     /// Lazily initialised NVML handle.
     pub struct GpuMonitor {
@@ -37,16 +51,20 @@ mod imp {
             Self { nvml: None }
         }
 
-        /// Returns `(name, celsius)` for every visible GPU.
+        /// Returns `(index, name, celsius)` for every visible GPU.
+        ///
+        /// The index is the NVML device index, which is stable as long as the
+        /// card and the driver stay put - that is the contract `GPU0`, `GPU1`
+        /// in `monitor_sources` relies on.
         ///
         /// The handle is cached on success and retried on every call after a
         /// failure, so a driver that is loaded after `fanctl` still gets picked
         /// up on the next cycle.
-        pub fn read(&mut self) -> Result<Vec<(String, f64)>, GpuError> {
+        pub fn read(&mut self) -> Result<Vec<(u32, String, f64)>, GpuError> {
             if self.nvml.is_none() {
-                match nvml_wrapper::Nvml::init() {
+                match init_nvml() {
                     Ok(nvml) => self.nvml = Some(nvml),
-                    Err(err) => return Err(GpuError::Init(err.to_string())),
+                    Err(err) => return Err(err),
                 }
             }
             let nvml = match self.nvml.as_ref() {
@@ -79,7 +97,28 @@ mod imp {
         }
     }
 
-    fn read_device(nvml: &nvml_wrapper::Nvml, index: u32) -> Result<(String, f64), String> {
+    /// Loads NVML from the first library name that resolves.
+    ///
+    /// The failure reported to the caller mentions every candidate, so a host
+    /// with a broken driver install still gets a usable diagnostic.
+    fn init_nvml() -> Result<nvml_wrapper::Nvml, GpuError> {
+        let mut tried = Vec::with_capacity(NVML_LIB_PATHS.len());
+        for path in NVML_LIB_PATHS {
+            match nvml_wrapper::Nvml::builder()
+                .lib_path(OsStr::new(path))
+                .init()
+            {
+                Ok(nvml) => {
+                    debug!(library = path, "NVML loaded");
+                    return Ok(nvml);
+                }
+                Err(err) => tried.push(format!("{path}: {err}")),
+            }
+        }
+        Err(GpuError::Init(tried.join("; ")))
+    }
+
+    fn read_device(nvml: &nvml_wrapper::Nvml, index: u32) -> Result<(u32, String, f64), String> {
         let device = nvml
             .device_by_index(index)
             .map_err(|err| format!("cannot open device {index}: {err}"))?;
@@ -87,7 +126,7 @@ mod imp {
             .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
             .map_err(|err| format!("device {index} temperature: {err}"))?;
         let name = device.name().unwrap_or_else(|_| format!("GPU{index}"));
-        Ok((name, f64::from(celsius)))
+        Ok((index, name, f64::from(celsius)))
     }
 
     impl Default for GpuMonitor {
@@ -111,7 +150,7 @@ mod imp {
         }
 
         /// Always fails: this build cannot read GPUs.
-        pub fn read(&mut self) -> Result<Vec<(String, f64)>, GpuError> {
+        pub fn read(&mut self) -> Result<Vec<(u32, String, f64)>, GpuError> {
             Err(GpuError::Disabled)
         }
     }

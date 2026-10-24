@@ -62,7 +62,7 @@ impl Engine {
                 .iter()
                 .flat_map(|zone| zone.sources.iter())
         };
-        let uses_gpu = all_sources().any(|source| matches!(source, Source::Gpu));
+        let uses_gpu = all_sources().any(|source| matches!(source, Source::Gpu(_)));
         let hub = SensorHub::new(&loaded.platform, all_sources(), uses_gpu);
         let actuator = PwmActuator::new(&loaded.platform, dry_run, timeout);
         let driven = driven_pins(&loaded.policy.zones)

@@ -276,6 +276,29 @@ fn a_board_sensor_called_gpu_is_rejected() {
 }
 
 #[test]
+fn a_board_sensor_called_gpu_with_an_index_is_rejected() {
+    let platform = PLATFORM.replace(
+        r#""SYS_Air_Outlet" = { sdr = "SYS_Air_Outlet", id = "0x31" }"#,
+        "\"SYS_Air_Outlet\" = { sdr = \"SYS_Air_Outlet\", id = \"0x31\" }\n\
+         \"GPU0\" = { sdr = \"GPU_Temp\", id = \"0x02\" }",
+    );
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(error.contains("reserved"), "unexpected error: {error}");
+}
+
+#[test]
+fn indexed_gpu_sources_are_accepted() {
+    // The index is resolved against NVML at runtime, so loading must accept it
+    // without a driver present; a wrong index surfaces as "no reading" later.
+    let policy = policy_with(ASCENDING, 2.0).replace(
+        r#"monitor_sources = ["CPU_Tctl"]"#,
+        r#"monitor_sources = ["CPU_Tctl", "gpu1", "GPU2"]"#,
+    );
+    let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy);
+    LoadedConfig::load(&policy_path, &platform_path).expect("`gpu1`/`GPU2` must be accepted");
+}
+
+#[test]
 fn the_gpu_source_is_case_insensitive() {
     let policy = policy_with(ASCENDING, 2.0).replace(
         r#"monitor_sources = ["CPU_Tctl"]"#,

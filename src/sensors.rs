@@ -11,7 +11,7 @@ use std::time::Duration;
 use tracing::{debug, error, warn};
 
 use crate::config::PlatformConfig;
-use crate::util::name::{is_gpu_source, GPU_SOURCE};
+use crate::util::name::{parse_gpu_source, GPU_SOURCE};
 
 pub mod gpu;
 pub mod ipmi;
@@ -39,16 +39,18 @@ fn is_plausible(celsius: f64) -> bool {
 pub enum Source {
     /// A sensor declared in `platform.toml` `[sensors]`.
     Ipmi(String),
-    /// All NVIDIA GPUs reported by NVML.
-    Gpu,
+    /// NVIDIA readings: `None` folds every device NVML reports, `Some(index)`
+    /// selects one device by its NVML index.
+    Gpu(Option<u32>),
 }
 
 impl Source {
     /// Parses a `monitor_sources` entry.
     ///
-    /// `"GPU"` (any spelling) is reserved; everything else is a semantic name
-    /// from `platform.toml` `[sensors]`, folded onto its declared spelling
-    /// later by [`crate::config::FanConfig::resolve_names`].
+    /// `"GPU"` and `"GPU<n>"` (any spelling) are reserved - the first folds
+    /// every device, the second selects one by NVML index; everything else is a
+    /// semantic name from `platform.toml` `[sensors]`, folded onto its declared
+    /// spelling later by [`crate::config::FanConfig::resolve_names`].
     ///
     /// Parsing is infallible and happens once, when the configuration is
     /// loaded: the control loop must never re-derive a source from a string.
@@ -56,18 +58,22 @@ impl Source {
     /// report it against the zone it was written in.
     pub fn parse(raw: &str) -> Self {
         let trimmed = raw.trim();
-        if is_gpu_source(trimmed) {
-            Source::Gpu
-        } else {
-            Source::Ipmi(trimmed.to_string())
+        match parse_gpu_source(trimmed) {
+            Some(index) => Source::Gpu(index),
+            None => Source::Ipmi(trimmed.to_string()),
         }
     }
 
     /// Name used in logs and reports.
-    pub fn label(&self) -> &str {
+    ///
+    /// Owned rather than borrowed because an indexed source has no stable
+    /// spelling in memory; this only runs on the logging and `check` paths, not
+    /// per cycle.
+    pub fn label(&self) -> String {
         match self {
-            Source::Ipmi(key) => key,
-            Source::Gpu => GPU_SOURCE,
+            Source::Ipmi(key) => key.clone(),
+            Source::Gpu(None) => GPU_SOURCE.to_string(),
+            Source::Gpu(Some(index)) => format!("{GPU_SOURCE}{index}"),
         }
     }
 }
@@ -77,8 +83,10 @@ impl Source {
 pub struct SensorSnapshot {
     /// Semantic sensor name -> degrees Celsius.
     pub ipmi: HashMap<String, f64>,
-    /// Per GPU name and temperature, empty when NVML is unavailable.
-    pub gpus: Vec<(String, f64)>,
+    /// Per GPU `(NVML index, name, temperature)`, empty when NVML is
+    /// unavailable. The index is kept explicitly because a device that fails to
+    /// report is skipped, which would otherwise shift every later reading.
+    pub gpus: Vec<(u32, String, f64)>,
     /// Non fatal problems worth logging.
     pub errors: Vec<String>,
 }
@@ -88,12 +96,20 @@ impl SensorSnapshot {
     pub fn get(&self, source: &Source) -> Option<f64> {
         match source {
             Source::Ipmi(key) => self.ipmi.get(key).copied(),
-            Source::Gpu => self.gpus.iter().map(|(_, celsius)| *celsius).fold(
+            Source::Gpu(None) => self.gpus.iter().map(|(_, _, celsius)| *celsius).fold(
                 None,
                 |best: Option<f64>, celsius| {
                     Some(best.map_or(celsius, |current| current.max(celsius)))
                 },
             ),
+            // A missing index yields `None`, which the engine already treats as
+            // "no reading": it holds the previous duty cycle and logs a warning
+            // instead of silently driving the zone from another card.
+            Source::Gpu(Some(wanted)) => self
+                .gpus
+                .iter()
+                .find(|(index, _, _)| index == wanted)
+                .map(|(_, _, celsius)| *celsius),
         }
     }
 

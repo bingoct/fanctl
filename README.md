@@ -101,7 +101,7 @@ fanctl/
 | `[platform].cmd_template` | 是 | — | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
 | `[platform].ipmitool_path` | 否 | `ipmitool`（走 `$PATH`） | 建议在服务器上写绝对路径 |
 | `[pins]` | 是，≥1 条 | — | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
-| `[sensors]` | 是，≥1 条 | — | 语义名 → `{ sdr = "…", id = "0xNN" }`；不允许占用 `GPU` |
+| `[sensors]` | 是，≥1 条 | — | 语义名 → `{ sdr = "…", id = "0xNN" }`；不允许占用 `GPU` / `GPU<n>` |
 
 `[sensors]` 的每条要写两个值，两者都必须对：
 
@@ -136,7 +136,7 @@ fanctl/
 |------|------|--------|------|
 | `[[zones]]` | 是，≥1 个 | — | 整段缺失在加载期报错 |
 | `[[zones]].name` | 是 | — | 唯一（忽略大小写），仅用于日志 |
-| `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` |
+| `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` / `GPU<n>` |
 | `[[zones]].aggregation` | 否 | 继承 `[global]` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
 | `[[zones]].target_pins` | 是 | — | 非空，必须在 `[pins]` 里 |
 | `[[zones]].default_duty_cycle` | 否 | 继承 `[global]` | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
@@ -161,7 +161,7 @@ fanctl/
 运行期每个分区拿到的都是确定值，不存在"空值再去看全局"的分支。
 
 **名字一律大小写不敏感。** `cpu_fan`、`CPU_FAN`、`Cpu_Fan` 是同一个引脚，
-`"gpu"` 与 `"GPU"` 等价。加载时会把 `config.toml` 里的引用统一改写成
+`"gpu"` 与 `"GPU"` 等价，`"gpu1"` 与 `"GPU1"` 等价。加载时会把 `config.toml` 里的引用统一改写成
 `platform.toml` 声明的大小写，之后再精确比较，所以 `check` 与 `run` 不会出现
 "检查通过、运行找不到"的偏差。`platform.toml` 里只差大小写的两个键（`CPU_FAN`
 与 `cpu_fan` 并存）会直接报错。SDR 名字还额外忽略分隔符：`CPU_Tctl_Value`、
@@ -172,7 +172,9 @@ TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于�
 引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
 `min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` →
 `fallback_duty_cycle` 不低于任何分区的待机档（失去全部读数不该比"测到很凉"更安静）→
-待机档在窗口内且不高于第一档 → 名字大小写冲突 → `[sensors]` 不得占用 `GPU`。
+待机档在窗口内且不高于第一档 → 名字大小写冲突 → `[sensors]` 不得占用 `GPU` / `GPU<n>`。
+`GPU<n>` 的编号是否存在要连上驱动才知道，属于运行期事实：`check` 会把实际枚举到的
+`GPU0..n` 打出来，编号写错时那个分区会走"无读数"路径（保持上一档并告警），不会 panic。
 
 > `deny_unknown_fields` 是刻意开的：写错字段名会直接报错，而不是安静地用了默认值。
 
@@ -205,9 +207,17 @@ raw 响应第一个字节是原始读数，第二个字节的 bit 5 表示"无�
 
 非温度（`RPM`、`no reading`、`ns`）记为"没有读数"而不是 0 —— 避免把缺数据的源当成低温。
 GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期会自动重试。
-`"GPU"` 只是 `monitor_sources` 里的一个关键字，与主板 SDR 无关：它扫描 NVML 下的
-所有 N 卡取最高，再作为一个源参与本分区的 `max`/`mean`。`[sensors]` 里不允许再定义
-同名键（加载时直接报错），避免一个名字指向两种数据源。
+`"GPU"` 只是 `monitor_sources` 里的一个关键字，与主板 SDR 无关：它把 NVML 下
+所有卡的读数取最高，再作为一个源参与本分区的 `max`/`mean`。
+
+需要只看某一张卡时写 `"GPU0"`、`"GPU1"`……编号就是 NVML 的 device index，
+`check` 会把每个编号对应哪张卡、多少度打出来。典型场景是"两张 4080 共用一个冷排，
+另一张 3080 自带风扇"：冷排分区写 `["GPU1", "GPU2"]`，那张自扇卡满载时就不会把
+冷排一起拉起来。编号由驱动枚举顺序决定，**不换卡、不重装驱动就不会变**；
+两张同型号的卡只能靠编号区分，不要按型号名猜。
+
+`[sensors]` 里不允许再定义 `GPU` 或 `GPU<n>`（加载时直接报错），避免一个名字
+指向两种数据源。
 
 聚合只统计"本周期真有值"的源：`mean` 不会因为没插显卡被拖到 0 ℃。
 

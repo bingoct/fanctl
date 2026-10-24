@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::util::name::{normalize, GPU_SOURCE};
+use crate::util::name::{normalize, parse_gpu_source, GPU_SOURCE};
 
 /// Contents of `platform.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -122,12 +122,17 @@ impl PlatformConfig {
         check_unique_names("[pins]", self.pins.keys(), &mut problems);
         check_unique_names("[sensors]", self.sensors.keys(), &mut problems);
 
-        // "GPU" is taken by the NVML provider; a sensor of that name would be
-        // shadowed in every `monitor_sources` entry, with no diagnostic.
-        if self.find_sensor(GPU_SOURCE).is_some() {
+        // `GPU` and `GPU<n>` are taken by the NVML provider; a sensor of that
+        // name would be shadowed in every `monitor_sources` entry, with no
+        // diagnostic.
+        if let Some(key) = self
+            .sensors
+            .keys()
+            .find(|name| parse_gpu_source(name).is_some())
+        {
             problems.push(format!(
-                "[sensors] must not define `{GPU_SOURCE}`: the name is reserved for the NVIDIA \
-                 readings and would shadow the SDR sensor"
+                "[sensors] must not define `{key}`: names starting with `{GPU_SOURCE}` are \
+                 reserved for the NVIDIA readings and would shadow the GPU source"
             ));
         }
 
