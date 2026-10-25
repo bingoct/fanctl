@@ -111,8 +111,6 @@ rpm_per_count = 138
 Fan speeds appear in the cycle log line, and a fan that stops turning produces a
 warning. They never influence a duty cycle.
 
-Two properties of this section are easy to get wrong.
-
 **The sensor number is not the channel.** `SYS_FAN_1` may be written through
 channel `0x02` and read back from sensor `0x61`. PWM channels and sensor numbers
 are separate numbering spaces with no arithmetic relation; each has to be looked
@@ -180,7 +178,6 @@ sudo ipmitool sdr get SYS_FAN_1      # Sensor Reading : 966 (+/- 0) RPM
 5. Only then run for real, watching `journalctl -u fanctl -f` for the first few
    minutes and confirming that the header that changed is the intended one.
 
-If the board needs a command shape `cmd_template` cannot express — a per-channel
-checksum, a two-step unlock before each write — the actuator needs code rather
-than configuration. Open an issue with the command sequence; rendering happens
-in `PwmActuator::render`.
+A board that needs a command shape `cmd_template` cannot express — a
+per-channel checksum, a two-step unlock before each write — needs code rather
+than configuration. Rendering happens in `PwmActuator::render`.

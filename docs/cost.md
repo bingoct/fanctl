@@ -16,7 +16,7 @@ Related: [design](design.md) · [configuration](config.md) · [platform](platfor
 | GPUs, afterwards | < 1 ms | 5 µs per device |
 | Aggregate, curve, merge | microseconds | arithmetic over a handful of values |
 | Write changed pins (4) | 135 ms | one `ipmitool exec`, only when something changed |
-| **Total, steady state** | **~185 ms per 10 s cycle** | 1.8 % of a core, 28 MB resident |
+| **Total, steady state** | **~185 ms per 10 s cycle** | 1.8 % of a core, 29 MB resident with GPUs |
 
 CPU time after 7 h 36 min of uptime: **5.5 seconds**, 0.02 % of one core. Idle,
 the process sleeps between cycles and writes nothing.
@@ -137,15 +137,42 @@ temperatures) builds to **1 399 248 bytes**, 106 KB smaller.
 
 ## Runtime footprint
 
-| Build | RSS | Anonymous | Threads |
-| --- | --- | --- | --- |
-| default (NVML) | 28 MB | 21 MB | 2 |
-| `--no-default-features` | 8 MB | 1.2 MB | 1 |
+Same binary, two configurations, resident set summed per mapping from `smaps`
+after 40 s of dry-run:
 
-The difference comes from linking the NVIDIA driver, which maps its own heap
-into the process. fanctl's own allocations are the 1.2 MB, a few kilobytes of
-configuration plus the sensor snapshot. RSS was unchanged over a 30-second probe
-after 7 hours of uptime.
+| GPU source in `config.toml` | RSS | writable | file-backed | threads |
+| --- | --- | --- | --- | --- |
+| no | **3.4 MB** | 204 kB | 3.1 MB | 2 |
+| yes | **28.9 MB** | 21.0 MB | 7.9 MB | 2 |
+
+Without a GPU source the program never calls `nvmlInit`. What is left is the
+program itself: 112 kB of heap, 92 kB of anonymous pages, and 3.1 MB of
+file-backed pages — 1.3 MB of binary, 1.5 MB of libc, the rest the dynamic
+loader and libgcc_s. File-backed pages are shared and reclaimable; the number
+that belongs to fanctl is a few hundred kilobytes.
+
+With a GPU source, the extra 25 MB is the NVIDIA driver. A 60-line C program
+that links `libnvidia-ml.so.1` and does nothing else shows where it goes:
+
+| Stage | RSS |
+| --- | --- |
+| start | 1 476 kB |
+| after `dlopen` | 2 260 kB |
+| after `nvmlInit` | 26 656 kB |
+| after reading three GPUs | 26 916 kB |
+| after `nvmlShutdown` | 26 904 kB |
+
+`nvmlInit` allocates it and `nvmlShutdown` does not return it. Reading GPU
+temperature in-process costs this in any program; the alternative is an
+`nvidia-smi` process per sample, which pays the same driver cost plus a process
+start, every cycle.
+
+RSS and peak RSS (`VmHWM`) are equal on a service that has been up for hours,
+and the heap stays at 132 kB: nothing grows per cycle.
+
+`.workbuddy/scripts/rss-breakdown.sh` reproduces the table. An earlier version of
+this document reported 8 MB for the no-NVML build; that was the RSS of `sudo`,
+measured instead of the process it started.
 
 ## Compared with a Go daemon on the same board
 
@@ -189,9 +216,8 @@ On writes fanctl is roughly 3× faster per change, because it starts one
    twenty in `platform.toml` costs nothing, watching them costs 13–17 ms each per
    cycle.
 3. **Build without the GPU feature** on a host without an NVIDIA card: 106 KB of
-   binary and 20 MB of resident memory.
+   binary and 25 MB of resident memory.
 4. **Drop the tachometers** if the log does not need speeds: seven readings
    become four, 183 ms becomes 130 ms.
 
-Parsing is 560 ns per cycle and the process start dominates the remainder, so
-nothing else is worth optimising.
+Parsing is 560 ns per cycle and the process start dominates the remainder.

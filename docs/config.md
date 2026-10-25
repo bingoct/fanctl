@@ -110,7 +110,7 @@ name = "pump"
 monitor_sources = ["Water_Inlet"]
 target_pins = ["SYS_FAN_4"]
 default_duty_cycle = 100    # never runs slow
-fallback_duty_cycle = 100   # never stops, even when blind
+fallback_duty_cycle = 100   # never stops, even with no reading
 
 [[zones.thresholds]]
 temperature = 20

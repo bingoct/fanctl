@@ -39,21 +39,14 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 
 /// How often an unchanged cycle line is repeated at INFO.
 ///
-/// Reporting every cycle would put ~8 600 lines a day in the journal for a
-/// machine sitting at room temperature; never repeating it leaves an operator
-/// unable to tell a healthy idle daemon from a dead one, because both produce
-/// silence. Five minutes is fine resolution for a temperature curve whose real
-/// events - a load starting, a fan stepping - also change the duty cycle and
-/// are logged on their own.
+/// It is the only routine evidence that the daemon is running: without it a
+/// healthy idle machine and a dead one both produce silence.
 const HEARTBEAT: Duration = Duration::from_secs(300);
 
 /// How far a temperature has to move before the cycle line is worth repeating.
 ///
-/// A BMC reports whole degrees and an idle EPYC wanders between 22 and 24 all
-/// day, so two degrees is still inside the noise: measured on the machine, a
-/// 2 C threshold produced three lines a minute with nothing running. Three
-/// degrees is above the flicker, and a real load crosses it within a cycle or
-/// two and keeps going.
+/// A BMC reports whole degrees and an idle EPYC wanders between 22 and 24, so a
+/// threshold of 2 C produced three lines a minute with nothing running.
 const REPORT_STEP_CELSIUS: f64 = 3.0;
 
 /// Source names of a zone, for the log lines that explain a missing reading.
@@ -80,46 +73,6 @@ fn temperatures(snapshot: &SensorSnapshot) -> Vec<(String, f64)> {
             .map(|(index, _, celsius)| (format!("{GPU_SOURCE}{index}"), *celsius)),
     );
     temps
-}
-
-/// How many tachometer counts a reading may move and still be the same speed.
-///
-/// Measured on the S8030's coolant pump held at 100 %: 43, 44 and 45 counts
-/// within a few minutes, a spread of two counts around 44. One count is not
-/// enough slack - with a threshold of one the pump alone produced a log line
-/// every ten seconds, which is the flood the change filter exists to prevent.
-///
-/// Two counts still catches what the comparison is for: a fan that stops (43
-/// counts to nothing), a header that loses its supply, or a duty cycle step big
-/// enough to matter. It does not narrate every single step of a quiet fan -
-/// and it does not need to, because a duty cycle change logs its own line.
-const TACHOMETER_NOISE_COUNTS: u32 = 2;
-
-/// `true` when a fan speed moved by more than the tachometer can resolve.
-///
-/// Unlike the temperature step this threshold is not chosen, it is derived: the
-/// BMC counts tach pulses over a fixed window and reports the count, so every
-/// reading is a multiple of one count's worth of RPM (138 on a TYAN S8030).
-/// [`TACHOMETER_NOISE_COUNTS`] is how far that reading wanders on its own.
-///
-/// The speeds are worth watching even though nothing in the control path reads
-/// them, because they are the only *measured* half of the pair: the duty cycle
-/// says what was asked of the header, the speed says what the fan did with it.
-/// A fan that died, a cable that came loose or a header that lost its rail is
-/// invisible in the duty cycle and obvious here.
-///
-/// A pin that appears or disappears counts too, for the same reason a missing
-/// sensor does.
-fn fans_moved(previous: Option<&[(String, u32)]>, current: &[(String, u32)], step: u32) -> bool {
-    let Some(previous) = previous else {
-        return true;
-    };
-    let noise = step.saturating_mul(TACHOMETER_NOISE_COUNTS);
-    previous.len() != current.len()
-        || current
-            .iter()
-            .zip(previous)
-            .any(|((pin, rpm), (was_pin, was))| pin != was_pin || rpm.abs_diff(*was) > noise)
 }
 
 /// Fans that turned last cycle and report nothing this cycle.
@@ -220,14 +173,12 @@ pub struct Engine {
     /// Consecutive cycles each zone has gone without a reading.
     zone_misses: Vec<u32>,
     last_sent: BTreeMap<String, u8>,
-    /// Temperatures and fan speeds as of the last reported cycle line - the
-    /// comparison that keeps an idle machine from logging every ten seconds -
-    /// and when that line was last sent at INFO.
+    /// Temperatures as of the last reported cycle line - the comparison that
+    /// keeps an idle machine from logging every ten seconds - the fan speeds as
+    /// of that cycle, for stall detection, and when the line was last sent.
     last_temperatures: Option<Vec<(String, f64)>>,
     last_fans: Option<Vec<(String, u32)>>,
     last_report_at: Option<Instant>,
-    /// One tachometer count in RPM, the resolution of every speed reading.
-    tach_step: u32,
     /// Pins at least one zone drives; the only ones the daemon may write.
     driven: Vec<String>,
     shutdown: Arc<AtomicBool>,
@@ -253,15 +204,6 @@ impl Engine {
             .into_iter()
             .map(str::to_string)
             .collect();
-        // Validation only lets `rpm_per_count` be absent when no tachometer is
-        // declared, in which case `fans` stays empty and the step is unused.
-        let tach_step = loaded
-            .platform
-            .info
-            .rpm_per_count
-            .unwrap_or(1.0)
-            .round()
-            .max(1.0) as u32;
 
         Self {
             platform: loaded.platform,
@@ -275,7 +217,6 @@ impl Engine {
             last_temperatures: None,
             last_fans: None,
             last_report_at: None,
-            tach_step,
             driven,
             shutdown,
             timeout,
@@ -581,12 +522,14 @@ impl Engine {
 
     /// Emits the per-cycle temperature line.
     ///
-    /// Rate limited by *change* rather than by a counter: a line whose
-    /// temperatures and fan speeds did not move is logged at DEBUG, and repeated
-    /// at INFO once [`HEARTBEAT`] has passed. The first cycle always reports.
+    /// At INFO when a temperature moved by [`REPORT_STEP_CELSIUS`] or when
+    /// [`HEARTBEAT`] has passed, at DEBUG otherwise. Fan speeds are carried in
+    /// the line but do not decide it: a tachometer wanders by a count or two on
+    /// its own, and a speed that changed while the temperature did not is not
+    /// worth a line of its own.
     ///
     /// This is the daemon's only routine statement that it is still turning,
-    /// and the only source a temperature curve can be drawn from.
+    /// and the source a temperature curve is drawn from.
     fn report_cycle(&mut self, snapshot: &SensorSnapshot) {
         let line = cycle_line(
             snapshot,
@@ -615,11 +558,9 @@ impl Engine {
             }
         }
 
-        // The threshold differs per kind: a BMC reads whole degrees, so only a
-        // move above the idle flicker is news, while speed is quantised by the
-        // tachometer and one count of that quantisation is always flicker.
-        let moved = temperatures_moved(self.last_temperatures.as_deref(), &temps)
-            || fans_moved(self.last_fans.as_deref(), &fans, self.tach_step);
+        // A BMC reads whole degrees, so only a move above the idle flicker is
+        // news.
+        let moved = temperatures_moved(self.last_temperatures.as_deref(), &temps);
         let due = self
             .last_report_at
             .is_none_or(|at| at.elapsed() >= HEARTBEAT);
@@ -652,7 +593,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{cycle_line, fans_moved, stalled, temperatures_moved};
+    use super::{cycle_line, stalled, temperatures_moved};
     use crate::sensors::SensorSnapshot;
 
     fn duties(
@@ -759,44 +700,10 @@ mod tests {
     }
 
     /// One tachometer count on the machine this was written for.
-    const STEP: u32 = 138;
-
     #[test]
-    fn the_pumps_own_wobble_is_not_a_change() {
-        // Measured: the coolant pump at a steady 100 % reads 43, 44 and 45
-        // counts within minutes. 5934 -> 6210 is two counts, which looked like
-        // motion until the machine produced a log line every ten seconds.
-        let previous = fans(&[("SYS_FAN_4", 5934), ("CPU_FAN", 690)]);
-        assert!(!fans_moved(
-            Some(&previous),
-            &fans(&[("SYS_FAN_4", 6072), ("CPU_FAN", 690)]),
-            STEP
-        ));
-        assert!(!fans_moved(
-            Some(&previous),
-            &fans(&[("SYS_FAN_4", 6210), ("CPU_FAN", 690)]),
-            STEP
-        ));
-    }
-
-    #[test]
-    fn three_tachometer_counts_is_a_change() {
-        // A real step: 1104 -> 1518 is the radiator being driven a step harder.
-        let previous = fans(&[("SYS_FAN_2", 1104)]);
-        assert!(fans_moved(
-            Some(&previous),
-            &fans(&[("SYS_FAN_2", 1518)]),
-            STEP
-        ));
-    }
-
-    #[test]
-    fn a_fan_that_stops_is_a_change_and_a_stall() {
-        // The case the whole comparison exists for: the duty cycle still says
-        // 30 %, the fan says nothing. Only the measured half can show this.
+    fn a_fan_that_stops_is_a_stall() {
         let previous = fans(&[("CPU_FAN", 690)]);
         let current = fans(&[("CPU_FAN", 0)]);
-        assert!(fans_moved(Some(&previous), &current, STEP));
         assert_eq!(stalled(Some(&previous), &current), vec!["CPU_FAN"]);
     }
 
@@ -814,12 +721,5 @@ mod tests {
         // Without a previous cycle there is no transition to report; the cycle
         // line itself carries the zero.
         assert!(stalled(None, &fans(&[("CPU_FAN", 0)])).is_empty());
-    }
-
-    #[test]
-    fn a_tachometer_that_comes_or_goes_is_a_change() {
-        let previous = fans(&[("CPU_FAN", 690)]);
-        assert!(fans_moved(Some(&previous), &fans(&[]), STEP));
-        assert!(fans_moved(None, &fans(&[("CPU_FAN", 690)]), STEP));
     }
 }

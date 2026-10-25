@@ -2,9 +2,8 @@
 
 **English** · [简体中文](design-cn.md)
 
-How one control cycle works and why the pieces are shaped the way they are.
-Configuration fields are in [config.md](config.md); measured timings are in
-[cost.md](cost.md).
+How one control cycle works. Configuration fields are in
+[config.md](config.md); measured timings are in [cost.md](cost.md).
 
 ## The cycle
 
@@ -179,11 +178,11 @@ recorded as successful.
 
 Two rules make the fallback value dependable:
 
-- `fallback_duty_cycle >= default_duty_cycle`, enforced per zone, so a blind
-  zone is never the quietest state of the machine.
+- `fallback_duty_cycle >= default_duty_cycle`, enforced per zone, so a zone
+  with no reading is never the quietest state of the machine.
 - A zone may override both values. A coolant pump uses
-  `default_duty_cycle = fallback_duty_cycle = 100`, which holds at idle, when
-  blind, and during shutdown.
+  `default_duty_cycle = fallback_duty_cycle = 100`, which holds at idle, with no
+  reading, and during shutdown.
 
 ### Shutdown
 
@@ -216,24 +215,23 @@ change:
 | Event | Level |
 | --- | --- |
 | any temperature moved ≥ 3 °C | INFO |
-| any fan speed moved more than two tachometer counts | INFO |
-| a sensor or tachometer appeared or disappeared | INFO |
+| a temperature appeared or disappeared | INFO |
 | nothing moved, under 5 minutes since the last INFO line | DEBUG |
 | nothing moved, 5 minutes elapsed | INFO |
 | a driven fan went from turning to zero | WARN |
 
-Both thresholds follow from the hardware. The BMC reports whole degrees and an
+The threshold follows from the hardware: the BMC reports whole degrees and an
 idle EPYC wanders between 22 and 24 °C, which logged three lines a minute at a
-2 °C threshold; 3 °C is above that flicker and a real load crosses it within a
-cycle or two. Speed is quantised by the tachometer itself: the pump at 100 %
-alternates between 5934 and 6072 RPM, one count of 138, so one count is noise
-and two counts are motion.
+2 °C threshold; 3 °C is above that flicker, and a real load crosses it within a
+cycle or two.
 
-Fan speed is part of the comparison although no duty cycle is computed from it.
-The duty cycle is what was requested, the speed is what the fan did. A stalled
-fan, a loose cable or a header that lost its rail is invisible in the duty cycle
-and visible in the speed. A fan reaching zero is logged once, on the transition,
-rather than every cycle.
+Fan speed is in the line but not in the decision. A tachometer reading wanders
+by a count or two on its own - the pump at 100 % alternates between 5934 and
+6072 RPM, one count of 138 - and a speed that moved while the temperature did
+not does not call for a line. A fan reaching zero does: the duty cycle says what
+was requested, the speed is what the fan did, and a stalled rotor, a loose cable
+or a header that lost its rail is visible only in the speed. That is logged once,
+on the transition, rather than every cycle.
 
 ## Safety and limits
 
