@@ -27,9 +27,9 @@ BMC 自带风扇策略不可用的服务器主板，用它做温控：读温度�
 | 主板 | 说明 |
 | --- | --- |
 | TYAN S8030GM2NE | 4 个 PWM 通道，传感器编号 0x60–0x64，转速系数 138 RPM/计数 |
-| 具备 OEM raw 风扇指令的其他主板 | 需自备 `platform.toml`；命令模板与传感器编号因厂商而异 |
 
-字段说明、查编号的方法和新增主板的步骤见 [docs/platform-cn.md](docs/platform-cn.md)。
+换一块主板需要另写一份 `platform.toml`。字段说明、查编号的方法和新增主板的步骤见
+[docs/platform-cn.md](docs/platform-cn.md)。
 
 ## 依赖
 
@@ -54,9 +54,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
 ```
 
-`examples/` 是 S8030 的参考配置。换主板需要另写一份 `platform.toml`
-（[docs/platform-cn.md](docs/platform-cn.md)）和配套的 `config.toml`
-（[docs/config-cn.md](docs/config-cn.md)）。
+`examples/` 是 S8030 的参考配置。
 
 ## 使用
 

@@ -5,7 +5,7 @@
 `config.toml` 描述策略：在某个温度下风扇应转多快。它不含硬件知识，引用的引脚名与
 传感器名全部通过 [`platform.toml`](platform-cn.md) 解析，且不区分大小写。
 
-相关：[设计](design-cn.md) · [支持平台](platform-cn.md) · [开销](cost-cn.md)
+相关：[设计](design-cn.md) · [主板](platform-cn.md) · [开销](cost-cn.md)
 
 ## 结构
 

@@ -32,10 +32,9 @@ writes the result back over IPMI raw.
 | Board | Notes |
 | --- | --- |
 | TYAN S8030GM2NE | 4 PWM channels, sensor numbers 0x60–0x64, tachometer scale 138 RPM/count |
-| other boards with an OEM raw fan command | needs its own `platform.toml`; command template and sensor numbers differ per vendor |
 
-[docs/platform.md](docs/platform.md) documents the fields, how to find the
-numbers, and how to add a board.
+A different board needs its own `platform.toml`. [docs/platform.md](docs/platform.md)
+documents the fields, how to find the numbers, and how to add one.
 
 ## Requirements
 
@@ -62,9 +61,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
 ```
 
-`examples/` holds the reference configuration for the S8030. Another board needs
-its own `platform.toml` ([docs/platform.md](docs/platform.md)) and a matching
-`config.toml` ([docs/config.md](docs/config.md)).
+`examples/` holds the reference configuration for the S8030.
 
 ## Use
 

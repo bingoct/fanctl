@@ -7,7 +7,7 @@ temperature. It contains no hardware knowledge; every pin and sensor name it
 references is resolved through [`platform.toml`](platform.md),
 case-insensitively.
 
-Related: [design](design.md) · [platform support](platform.md) · [cost](cost.md)
+Related: [design](design.md) · [platform](platform.md) · [cost](cost.md)
 
 ## Shape
 

@@ -1,4 +1,4 @@
-# Platform support
+# Platform
 
 **English** · [简体中文](platform-cn.md)
 
@@ -10,15 +10,17 @@ Related: [configuration](config.md) · [design](design.md) · [cost](cost.md)
 
 ## Verified boards
 
-| Board | BMC | Status | Details |
-| --- | --- | --- | --- |
-| TYAN S8030GM2NE | AST2500 | verified on hardware | 4 PWM channels in use, sensors 0x60–0x64, tachometer scale 138 RPM/count |
-| any board with an OEM raw fan command | — | expected to work | needs a new `platform.toml`; see [adding a board](#adding-a-board) |
+| Board | BMC | Details |
+| --- | --- | --- |
+| TYAN S8030GM2NE | AST2500 | 4 PWM channels in use, sensors 0x60–0x64, tachometer scale 138 RPM/count |
 
-"Verified" means: `fanctl check` passes against the live BMC, every sensor
-number was cross-checked against `ipmitool sdr get`, the channel-to-header
-mapping was confirmed by writing one channel and watching which fan changed
-speed, and the daemon has run as a systemd service.
+Verified means: `fanctl check` passes against the live BMC, every sensor number
+was cross-checked against `ipmitool sdr get`, the channel-to-header mapping was
+confirmed by writing one channel and watching which fan changed speed, and the
+daemon has run as a systemd service.
+
+Any other board with an OEM raw fan command is expected to work and needs its
+own `platform.toml`; [adding a board](#adding-a-board).
 
 Dell iDRAC, HPE iLO and Supermicro boards with Redfish fan profiles are not
 supported. They expose fan control through a web API rather than a raw IPMI
