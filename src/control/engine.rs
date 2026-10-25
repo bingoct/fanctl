@@ -82,13 +82,25 @@ fn temperatures(snapshot: &SensorSnapshot) -> Vec<(String, f64)> {
     temps
 }
 
+/// How many tachometer counts a reading may move and still be the same speed.
+///
+/// Measured on the S8030's coolant pump held at 100 %: 43, 44 and 45 counts
+/// within a few minutes, a spread of two counts around 44. One count is not
+/// enough slack - with a threshold of one the pump alone produced a log line
+/// every ten seconds, which is the flood the change filter exists to prevent.
+///
+/// Two counts still catches what the comparison is for: a fan that stops (43
+/// counts to nothing), a header that loses its supply, or a duty cycle step big
+/// enough to matter. It does not narrate every single step of a quiet fan -
+/// and it does not need to, because a duty cycle change logs its own line.
+const TACHOMETER_NOISE_COUNTS: u32 = 2;
+
 /// `true` when a fan speed moved by more than the tachometer can resolve.
 ///
 /// Unlike the temperature step this threshold is not chosen, it is derived: the
 /// BMC counts tach pulses over a fixed window and reports the count, so every
-/// reading is a multiple of one count's worth of RPM (138 on a TYAN S8030). A
-/// pump at 100 % alternates between 5934 and 6072 forever - exactly one count,
-/// and no news at all. Two counts is a real change.
+/// reading is a multiple of one count's worth of RPM (138 on a TYAN S8030).
+/// [`TACHOMETER_NOISE_COUNTS`] is how far that reading wanders on its own.
 ///
 /// The speeds are worth watching even though nothing in the control path reads
 /// them, because they are the only *measured* half of the pair: the duty cycle
@@ -102,11 +114,12 @@ fn fans_moved(previous: Option<&[(String, u32)]>, current: &[(String, u32)], ste
     let Some(previous) = previous else {
         return true;
     };
+    let noise = step.saturating_mul(TACHOMETER_NOISE_COUNTS);
     previous.len() != current.len()
         || current
             .iter()
             .zip(previous)
-            .any(|((pin, rpm), (was_pin, was))| pin != was_pin || rpm.abs_diff(*was) > step)
+            .any(|((pin, rpm), (was_pin, was))| pin != was_pin || rpm.abs_diff(*was) > noise)
 }
 
 /// Fans that turned last cycle and report nothing this cycle.
@@ -749,25 +762,30 @@ mod tests {
     const STEP: u32 = 138;
 
     #[test]
-    fn one_tachometer_count_is_not_a_change() {
-        // The pump at 100 % alternates between 5934 and 6072 forever. Both are
-        // 43 and 44 counts of 138 RPM, so this is quantisation, not motion -
-        // reporting it logged four lines in 45 s on an idle machine.
+    fn the_pumps_own_wobble_is_not_a_change() {
+        // Measured: the coolant pump at a steady 100 % reads 43, 44 and 45
+        // counts within minutes. 5934 -> 6210 is two counts, which looked like
+        // motion until the machine produced a log line every ten seconds.
         let previous = fans(&[("SYS_FAN_4", 5934), ("CPU_FAN", 690)]);
         assert!(!fans_moved(
             Some(&previous),
             &fans(&[("SYS_FAN_4", 6072), ("CPU_FAN", 690)]),
             STEP
         ));
+        assert!(!fans_moved(
+            Some(&previous),
+            &fans(&[("SYS_FAN_4", 6210), ("CPU_FAN", 690)]),
+            STEP
+        ));
     }
 
     #[test]
-    fn two_tachometer_counts_is_a_change() {
-        // A real step: 1104 -> 1380 is one header being driven harder.
+    fn three_tachometer_counts_is_a_change() {
+        // A real step: 1104 -> 1518 is the radiator being driven a step harder.
         let previous = fans(&[("SYS_FAN_2", 1104)]);
         assert!(fans_moved(
             Some(&previous),
-            &fans(&[("SYS_FAN_2", 1380)]),
+            &fans(&[("SYS_FAN_2", 1518)]),
             STEP
         ));
     }
