@@ -25,6 +25,21 @@ use crate::util::name::sdr_key;
 /// are not 1:1 is off by tens of degrees, not by two.
 const RAW_READ_TOLERANCE_CELSIUS: f64 = 2.0;
 
+/// How far a tachometer reading may move between the two `check` samples.
+///
+/// Not the same problem as the temperature tolerance: a fan's speed is quantised
+/// to one count of `rpm_per_count` (138 RPM here), so a reading that flickers by
+/// one count is normal - and the two samples are seconds apart, with the SDR scan
+/// in between. Measured on the S8030's coolant pump at 100 %, one sample apart:
+/// 43, 44 and 45 counts, all three of them, so a single count of slack rejects
+/// good readings two times in five.
+///
+/// Three counts still catches every way of getting the coefficient wrong: a
+/// missing factor of 138 is off by two orders of magnitude, a factor of two by
+/// 43 counts on this pump. The check exists to catch a scale factor that prints
+/// a confident RPM for a fan nobody is measuring, not to police a rotor.
+const TACHOMETER_TOLERANCE_COUNTS: f64 = 3.0;
+
 /// Entry point used by `main`.
 ///
 /// Failures are reported where they happen: `check` prints one line per
@@ -43,10 +58,21 @@ pub fn run(cli: Cli) -> ExitCode {
     }
 }
 
+/// `true` when a raw tachometer count and an SDR reading describe the same fan.
+///
+/// The SDR reading has the coefficient applied, so dividing it back out has to
+/// land on the raw count - up to the noise between two samples, which is one
+/// count of quantisation either way.
+fn tachometer_agrees(count: f64, rpm: f64, scale: f64) -> bool {
+    (rpm / scale - count).abs() <= TACHOMETER_TOLERANCE_COUNTS
+}
+
 /// Validates the configuration and probes the running hardware.
 ///
 /// Exit code is non-zero when a configured sensor cannot be read, because in
-/// that state the daemon would constantly fall back to `fallback_duty_cycle`.
+/// that state the daemon would constantly fall back to `fallback_duty_cycle`. A
+/// tachometer whose two readings disagree is also fatal: it means
+/// `rpm_per_count` is wrong, and every speed in the log would be wrong with it.
 fn check(cli: &Cli) -> ExitCode {
     println!("fanctl {} - configuration check", crate::VERSION);
     println!("  policy   : {}", cli.config.display());
@@ -303,9 +329,7 @@ fn check(cli: &Cli) -> ExitCode {
             // returns the count that the SDR coefficients would have scaled.
             match (count, detail.celsius) {
                 (Some(count), Some(rpm)) => {
-                    // One count of slack: the two reads are seconds apart and a
-                    // tachometer's last digit flickers.
-                    if (rpm / scale - count).abs() <= 1.0 {
+                    if tachometer_agrees(count, rpm, scale) {
                         println!(
                             "[ ok ] tachometer `{pin}` <- `{}` (0x{:02x}) = {rpm} RPM, raw \
                              {count} x {scale}",
@@ -376,9 +400,10 @@ fn check(cli: &Cli) -> ExitCode {
 
     println!();
     if missing > 0 {
-        println!(
-            "[fail] {missing} configured sensor(s) cannot be read - fix platform.toml [sensors]"
-        );
+        // Deliberately not "[sensors]": a tachometer and a scale factor are
+        // also counted here, and the message used to send the reader to the
+        // wrong table.
+        println!("[fail] {missing} configured reading(s) could not be verified - see above");
         return ExitCode::FAILURE;
     }
 
@@ -582,8 +607,30 @@ fn ends_mid_number(name: &str, offset: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends_mid_number, find_fan_sensor};
+    use super::{ends_mid_number, find_fan_sensor, tachometer_agrees};
     use crate::sensors::ipmi::SdrEntry;
+
+    /// One tachometer count on the board this was written for.
+    const SCALE: f64 = 138.0;
+
+    #[test]
+    fn a_pump_reading_that_wanders_still_agrees() {
+        // Measured on the S8030's coolant pump at 100 %: three consecutive
+        // samples read 43, 44 and 45 counts. A single count of slack rejected
+        // two runs in five, on the command that gates a deployment.
+        assert!(tachometer_agrees(45.0, 5934.0, SCALE)); // 43 counts
+        assert!(tachometer_agrees(43.0, 6210.0, SCALE)); // 45 counts
+        assert!(tachometer_agrees(43.0, 6348.0, SCALE)); // 46 counts, the edge
+    }
+
+    #[test]
+    fn a_coefficient_that_is_wrong_by_a_factor_is_rejected() {
+        // The failure this check exists for: a plausible RPM for a fan nobody
+        // is measuring. Neither a missing factor of 138 nor a doubled one can
+        // hide inside the tolerance.
+        assert!(!tachometer_agrees(45.0, 5934.0, 1.0));
+        assert!(!tachometer_agrees(45.0, 5934.0, 276.0));
+    }
 
     fn entries(names: &[&str]) -> Vec<SdrEntry> {
         names
