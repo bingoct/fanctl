@@ -1,12 +1,13 @@
 [package]
 name = "fanctl"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # Floor imposed by `resolver = "3"` (the MSRV-aware resolver), not by a
 # language feature: an older cargo cannot even parse this manifest.
 rust-version = "1.84"
 resolver = "3"
 description = "Hardware-agnostic IPMI fan control daemon for server boards"
+license = "GPL-3.0-or-later"
 keywords = ["ipmi", "fan", "daemon", "server", "pwm"]
 categories = ["command-line-utilities", "hardware-support"]
 readme = "README.md"

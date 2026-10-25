@@ -1,7 +1,7 @@
 # fanctl - business logic: zones, curves, coupling
 #
 # Semantics only. Pin names and sensor names are resolved through platform.toml;
-# they are matched case-insensitively. Documented in README.md; validate with
+# they are matched case-insensitively. Documented in docs/config.md; validate with
 # `fanctl check`.
 
 [global]

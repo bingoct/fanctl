@@ -476,7 +476,7 @@ fn an_empty_monitor_source_is_rejected() {
 #[test]
 fn an_omitted_timeout_gets_the_documented_default() {
     // `policy_with` leaves `command_timeout_seconds` out on purpose: this test
-    // is the machine-checked link between `config/defaults.rs` and README §3.2.
+    // is the machine-checked link between `config/defaults.rs` and docs/config.md.
     let (_dir, policy_path, platform_path) = fixture(PLATFORM, &policy_with(ASCENDING, 2.0));
     let loaded = LoadedConfig::load(&policy_path, &platform_path).expect("valid");
     assert_eq!(loaded.policy.global.command_timeout_seconds, 10);

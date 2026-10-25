@@ -40,7 +40,8 @@ rpm_per_count = 138
 # pin -> the fan sensor on the same header. Optional, and reported only: the
 # measured speed appears in the cycle log line next to the duty cycle the
 # daemon asked for, so "the write landed" can be told from "the header drives
-# nothing". Nothing here ever changes a decision.
+# nothing". Nothing here changes a duty cycle; a fan that stops turning is
+# warned about.
 #
 # A pin may have a tachometer without any zone driving it (a pump on straight
 # 12 V keeps its tach wire), and the sensor number is independent of the PWM

@@ -1,38 +1,122 @@
 # fanctl
 
-基于 Rust 的服务器风扇控制守护进程：读 IPMI / NVML 温度，按分区曲线算出 PWM，
-再用 `ipmitool raw` 写回主板，替代 BIOS 里那种"要么吵、要么热"的粗糙逻辑。
+**English** · [简体中文](README-cn.md)
 
-目标环境：**Tyan S8030 + AMD EPYC 7413 + NVIDIA GPU**，Linux + systemd。
-硬件差异全部落在 `platform.toml`，控制逻辑里没有一处十六进制常量。
+A fan control daemon for server boards whose BMC has no usable fan curve.
 
-当前状态：`cargo build` / `cargo test`（Linux 上 116 个测试）/ `cargo clippy --all-targets`（零告警）/
-`cargo fmt --check` 全部通过。已在 TYAN S8030GM2NE 真机上完成 `check` → 5 分钟 `--dry-run` →
-10 分钟正式运行的验收（4 个分区、4 个引脚、SIGTERM 复位全部实测），并以 systemd 服务形式接管；
-上机流程见"安全须知"。
+It reads temperatures straight off the BMC over IPMI — and NVIDIA GPUs over
+NVML — turns them into duty cycles with a per-zone curve, and writes the result
+back with `ipmitool raw`. Built for a Tyan S8030 whose "Smart Fan" is either a
+jet engine or a slow cook, but nothing in the control path knows about that
+board: every hex constant, sensor number and command template lives in
+`platform.toml`.
 
----
+```
+cycle temps CPU_Tctl=23.0 GPU0=28.0 GPU1=26.0 | fan CPU_FAN=690 SYS_FAN_1=966 | duty cpu=30 intake=35
+```
 
-## 1. 快速开始
+## Features
+
+**Dynamic control, not a static profile.** A five-step curve per zone with
+asymmetric hysteresis: a rising temperature switches immediately (possibly
+several steps), a falling one has to clear the step below by
+`debounce_celsius` before dropping. Heat gets a reaction, noise gets a delay.
+See [design](docs/design.md#the-curve).
+
+**The board is a configuration file.** Pin ids, sensor numbers, the `ipmitool`
+argument template and the tachometer scale all live in `platform.toml`. There
+is not one hexadecimal constant in the Rust source. Another board means another
+file, not another fork — see [platform support](docs/platform.md).
+
+**Zones.** A zone is one question ("how fast should these fans turn?") answered
+from any number of sensors: CPU, case air, individual GPU, mean over a group.
+One pin can be claimed by several zones and always gets the highest demand, and
+`[[follows]]` expresses plain couplings ("the intake must never be slower than
+the CPU fan") without a tangle of conditionals. See
+[design](docs/design.md#merging).
+
+**IPMI raw, not `ipmitool sdr`.** The whole SDR table costs 2.9 s per poll
+because every row is a round trip. fanctl reads only the sensors a zone
+actually uses, packs every read into a single `ipmitool exec`, and parses the
+BMC's own replies: 94 ms for one sensor, 185 ms for seven. Writes are batched
+the same way — four pins in 135 ms instead of 419 ms. See
+[cost](docs/cost.md).
+
+**Rust, one small binary.** 1.44 MiB, statically linked apart from libc and
+libgcc_s, no runtime, 2 threads, 8 MB resident without the NVIDIA driver
+loaded. `panic = "abort"`, `#[forbid(unsafe_code)]`, no `unwrap` in production
+code.
+
+Status: 122 tests, clean `clippy -D warnings` and `rustfmt`, all on Linux. The
+acceptance run on a TYAN S8030GM2NE (EPYC 7413, 3 GPUs) covered `check` against
+the real BMC, a 5-minute dry run, ten minutes of live control and a `SIGTERM`
+restore; the daemon has been running there as a systemd service since. Read
+[Safety](docs/design.md#safety-and-limits) before pointing it at a machine you
+care about.
+
+## Supported platforms
+
+| Board | Status | Notes |
+|---|---|---|
+| TYAN S8030GM2NE | verified | CPU_FAN + 3 × SYS_FAN headers, tachometer scale 138 RPM/count, `raw 0x2e 0x44 0xfd 0x19 0x00 <ch> 0x01 <duty>` |
+| other boards with an OEM raw fan command | should work | needs a `platform.toml`; the command template and sensor numbers differ per vendor |
+
+The daemon speaks IPMI generically — what it cannot guess is the vendor's
+private PWM command. If your board answers to `raw 0x2e 0x44 …` (most
+AST2500/AST2600 boards with a "Smart Fan" and a manual override do) it is a
+configuration exercise, and [docs/platform.md](docs/platform.md) walks through
+it: finding sensor numbers, mapping channels, and closing the loop to prove
+which header is which. `fanctl check` verifies the mapping against the live BMC
+before the first write.
+
+## Requirements
+
+- Linux with systemd. Nothing else in the way of init integration is provided.
+- `ipmitool` ≥ 1.8, with permission to reach `/dev/ipmi0` (root, or a udev rule
+  granting `CAP_SYS_RAWIO`).
+- A BMC whose fan channels accept a raw PWM command.
+- Rust 1.84+ to build (`resolver = "3"` needs it). `Cargo.lock` is committed.
+- Optional: the NVIDIA driver, if you want GPU temperatures. Build with
+  `--no-default-features` on a machine without one.
+
+## Install
+
+There are no packages yet. Build and install by hand:
 
 ```bash
 cargo build --release
+cargo build --release --no-default-features    # no NVIDIA driver on the host
 
-sudo install -Dm755 target/release/fanctl /usr/local/bin/fanctl
-sudo install -Dm644 examples/platform.toml /etc/fanctl/platform.toml
-sudo install -Dm644 examples/config.toml   /etc/fanctl/config.toml
+sudo install -Dm755 target/release/fanctl          /usr/local/bin/fanctl
+sudo install -Dm644 examples/platform.toml         /etc/fanctl/platform.toml
+sudo install -Dm644 examples/config.toml           /etc/fanctl/config.toml
+```
 
-# 1) 静态校验 + 硬件探测（会真的执行 ipmitool sdr / sdr get / 一次批量 raw 读）
+`examples/` carries the reference configuration for the verified board — start
+there, then read [configuration](docs/config.md) and adjust the curve to your
+hardware. Both files are validated as a pair; `fanctl check` reports every
+problem at once instead of the first one.
+
+## Use
+
+Three steps, in this order. Each one is a superset of the previous.
+
+```bash
+# 1. Validate both config files and probe the hardware: reads the sensor
+#    numbers named in platform.toml, cross-checks them against `ipmitool sdr`,
+#    lists the GPUs, and does one batched raw read. Writes nothing.
 sudo fanctl check
 
-# 2) 只读演练：读温度、算档位、打日志，不发任何控制指令
+# 2. Run the control loop but send no PWM command. Logs exactly what it would
+#    have written, every cycle. This is the step that catches "the curve is
+#    wrong", not the config validator.
 sudo fanctl run --dry-run -v
 
-# 3) 正式运行（前台，交给 systemd 托管）
+# 3. Run for real, in the foreground, and let systemd supervise it.
 sudo fanctl run
 ```
 
-systemd：
+Under systemd:
 
 ```bash
 sudo install -Dm644 packaging/fanctl.service /etc/systemd/system/fanctl.service
@@ -41,390 +125,88 @@ sudo systemctl enable --now fanctl
 journalctl -u fanctl -f
 ```
 
-常用参数：`-c/--config`、`-p/--platform`（可与默认路径不同）、`-v`/`-vv`、`run --dry-run`。
-`-v` 调整日志级别（默认 INFO，`-v` DEBUG，`-vv` TRACE）；`RUST_LOG=debug` 可覆盖它，
-但只接受全局级别（`error|warn|info|debug|trace|off`），不支持 `fanctl::control=trace` 这种按模块的指令——
-写了会打印一行提示并回落到 `-v`，不会静默失效。
-退出码：`0` 正常（含收到 SIGTERM 后优雅退出），`1` 失败（配置错误、ipmitool 不可用等）。
+The unit is written for root and for a foreground process: no `PIDFile=`, no
+`PrivateDevices=` (it would hide `/dev/ipmi*`), `TimeoutStopSec=120s` to cover
+the restore writes.
 
----
+Logs are the interface. One line per cycle, rate-limited by change:
 
-## 2. 项目结构
-
-```
-fanctl/
-├── Cargo.toml                 # 依赖、feature、lints（unsafe 禁止、clippy::all）
-├── rust-toolchain.toml        # stable + rustfmt/clippy
-├── src/
-│   ├── main.rs                # 只做：解析 CLI → 初始化日志 → 调 app::run
-│   ├── lib.rs                 # 库入口，分层文档
-│   ├── error.rs               # 两个错误枚举：Error / CommandError
-│   ├── logging.rs             # tracing → stdout（journald，无 ANSI），进程级配置一次
-│   ├── actuator.rs            # 唯一写主板的地方（渲染模板 + ipmitool）
-│   ├── bmc.rs                 # IPMI 批处理协议：脚本拼装 + 分隔符槽位解析（读/写共用）
-│   ├── app.rs                 # 子命令编排：check / run，信号注册
-│   ├── app/
-│   │   └── cli.rs             # clap 定义
-│   ├── config.rs              # 加载 + 两份文件的交叉校验
-│   ├── config/
-│   │   ├── defaults.rs        # 两份配置的全部默认值（唯一一处）
-│   │   ├── platform.rs        # platform.toml：引脚 id、传感器名、指令模板
-│   │   └── policy.rs          # config.toml：全局、分区、联动
-│   ├── sensors.rs             # SensorHub、Source、SensorSnapshot（温度 + GPU + 转速）
-│   ├── sensors/
-│   │   ├── ipmi.rs            # 批量 raw 读 + sdr 解析（纯函数，可单测）
-│   │   └── gpu.rs             # nvml-wrapper，惰性初始化 + feature 开关
-│   ├── control.rs             # 聚合（max/mean）
-│   ├── control/
-│   │   ├── curve.rs           # 非对称防抖状态机
-│   │   ├── merge.rs           # 冲突取大 → 联动 → 上下限
-│   │   └── engine.rs          # 控制循环、失败策略、优雅退出
-│   ├── util.rs                # 只收纳跨层共用的小工具
-│   └── util/
-│       ├── name.rs            # 名字归一化（大小写不敏感）
-│       └── process.rs         # 子进程：超时即杀、非零退出即错误
-├── examples/                  # 可直接用的 platform.toml / config.toml
-├── packaging/fanctl.service   # systemd 单元模板
-└── tests/                     # 集成测试（配置校验、控制逻辑、生命周期）
-```
-
-分层规则一句话：**`control` 只做决定，`actuator` 只做执行，`config` 只有数据。**
-因此 `control/` 的全部逻辑都能在没有主板、没有 BMC 的机器上测试。
-
----
-
-## 3. 配置
-
-### 3.1 `platform.toml` — 硬件适配层
-
-| 字段 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| `[platform].name` | 是 | — | 板名，仅用于日志 |
-| `[platform].cmd_template` | 是 | — | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
-| `[platform].ipmitool_path` | 否 | `ipmitool`（走 `$PATH`） | 建议在服务器上写绝对路径 |
-| `[platform].rpm_per_count` | `[tachometers]` 非空时必填 | — | 一个转速计数等于多少 RPM（SDR 记录里的 M 系数） |
-| `[pins]` | 是，≥1 条 | — | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
-| `[sensors]` | 是，≥1 条 | — | 语义名 → `{ sdr = "…", id = "0xNN" }`；不允许占用 `GPU` / `GPU<n>` |
-| `[tachometers]` | 否 | 空 | 引脚名 → `{ sdr = "…", id = "0xNN" }`，只用于日志里的实测转速 |
-
-`[sensors]` 的每条要写两个值，两者都必须对：
-
-```toml
-[sensors]
-"CPU_Tctl" = { sdr = "CPU_Tctl_Value", id = "0x01" }
-```
-
-- `id` 是 IPMI **传感器编号**，控制循环用它读温度（`raw 0x04 0x2d <id>`）。
-- `sdr` 是 `ipmitool sdr` 打印的名字，`check` 用它做诊断和交叉验证。
-
-编号可以从 `ipmitool sdr get '<名字>'` 第一行拿到（`Sensor ID : CPU_Tctl_Value (0x1)`）。
-两个语义名指向同一个编号会在加载期报错；`check` 还会把 raw 读数和 `ipmitool sdr`
-比一遍，差超过 2 ℃ 就判失败——那意味着这块板子的温度不能直接当摄氏度用。
-
-`[tachometers]` 把**实测转速**带进每个周期的日志行（见 4.1）。它只报告，不参与任何决策：
-
-```toml
-[platform]
-rpm_per_count = 138      # 一个计数 = 138 RPM
-
-[tachometers]
-"SYS_FAN_1" = { sdr = "SYS_FAN_1", id = "0x61" }
-```
-
-`raw 0x04 0x2d` 拿到的是**计数**，不是 `ipmitool sdr` 打印的 RPM——M 系数是 `ipmitool`
-在本地折算的，BMC 不管。这块板所有风扇读数都是 138 的整数倍，所以系数是 138；
-`check` 会把 `计数 × 系数` 和 `ipmitool sdr get` 的读数比一遍，差一个计数以上就判失败，
-免得日志里印出一个没人测量过的转速。
-
-键名是**引脚名**，但不必和 `[pins]` 一一对应：水泵改成大 4pin 常供之后不再是 fanctl
-写的引脚，转速线却还插在主板上，这时从 `[pins]` 删掉、在 `[tachometers]` 留着即可。
-转速传感器编号和 PWM 通道号是两套数：`SYS_FAN_1` 写通道 `0x02`，读转速却是 `0x61`。
-
-### 3.2 `config.toml` — 业务逻辑层
-
-| 字段 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| `[global].interval_seconds` | 是 | — | 采样**周期**（≥1）。周期含本轮耗时，不是"跑完再睡这么久" |
-| `[global].min_duty_cycle` | 是 | — | 全局下限，1..=100 且 ≤ `max_duty_cycle`（不允许停转） |
-| `[global].max_duty_cycle` | 是 | — | 全局上限，≤100 |
-| `[global].fallback_duty_cycle` | 是 | — | 分区读不到读数时的保底转速（分区可覆盖），必须落在 `min_duty_cycle..=max_duty_cycle` |
-| `[global].fallback_after_cycles` | 否 | `2` | 连续多少个周期没有读数才降保底档，≥1 |
-| `[global].default_duty_cycle` | 是 | — | 待机转速；分区省略时继承它。必须落在 `min_duty_cycle..=max_duty_cycle`，且不得高于本分区第一档 |
-| `[global].debounce_celsius` | 否 | `2.0` | 降档防抖（℃）；分区省略时继承它 |
-| `[global].aggregation` | 否 | `max` | 聚合方式；分区省略时继承它 |
-| `[global].command_timeout_seconds` | 否 | `10` | 单次 `ipmitool` 的超时，≥1 |
-
-分区与联动：
-
-| 字段 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| `[[zones]]` | 是，≥1 个 | — | 整段缺失在加载期报错 |
-| `[[zones]].name` | 是 | — | 唯一（忽略大小写），仅用于日志 |
-| `[[zones]].monitor_sources` | 是 | — | 非空；每项是 `[sensors]` 的键，或保留名 `GPU` / `GPU<n>` |
-| `[[zones]].aggregation` | 否 | 继承 `[global]` | `max` 或 `mean`，只对**本周期读到值**的源生效 |
-| `[[zones]].target_pins` | 是 | — | 非空，必须在 `[pins]` 里 |
-| `[[zones]].default_duty_cycle` | 否 | 继承 `[global]` | 1..=100；低于第一档阈值时的转速，也是退出时写回的值 |
-| `[[zones]].fallback_duty_cycle` | 否 | 继承 `[global]` | 1..=100，且不得低于本分区的 `default_duty_cycle`；水泵这类"不能停"的执行器设成 100 |
-| `[[zones]].fallback_after_cycles` | 否 | 继承 `[global]` | ≥1；本分区连续多少个周期没有读数才降保底档 |
-| `[[zones]].debounce_celsius` | 否 | 继承 `[global]` | 单侧防抖（只作用于降档），≥0 且必须小于相邻阈值间隔 |
-| `[[zones]].thresholds` | 是，≥1 条 | — | 缺了在加载期报错 |
-| `[[zones.thresholds]].temperature` | 是 | — | 必须严格升序 |
-| `[[zones.thresholds]].duty_cycle` | 是 | — | 1..=100 |
-| `[[follows]]` | 否 | 无规则 | 整段可以省略；写了才校验 |
-| `[[follows]].pin` | 是 | — | 必须被某个 zone 驱动 |
-| `[[follows]].min_of` | 是 | — | 同上；不能等于 `pin` |
-
-上表"默认值"一列与 `src/config/defaults.rs` 是同一份信息，且由
-`tests/config_validation.rs::an_omitted_timeout_gets_the_documented_default` 钉住：
-只有 `ipmitool_path`、`command_timeout_seconds`、`debounce_celsius`、`aggregation`、
-`fallback_after_cycles` 五个字段**可省略且有初值**；其余要么必填，要么是"继承 `[global]`"
-而不是取默认值（分区里的 `aggregation`、`default_duty_cycle`、`debounce_celsius`、
-`fallback_duty_cycle`、`fallback_after_cycles` 属于后者）。
-运行期调参（子进程轮询退避、关停轮询间隔、温度合理性区间）不在这个文件里，
-`defaults.rs` 文件头有一张指路表指向它们的实际位置。
-
-`aggregation`、`default_duty_cycle`、`debounce_celsius`、`fallback_duty_cycle`、
-`fallback_after_cycles` 在 `[global]` 里是**共享策略**：分区不写就继承，写了就覆盖。
-继承在加载时一次性展开（`FanConfig::from_raw`），运行期每个分区拿到的都是确定值，
-不存在"空值再去看全局"的分支。
-
-**名字一律大小写不敏感。** `cpu_fan`、`CPU_FAN`、`Cpu_Fan` 是同一个引脚，
-`"gpu"` 与 `"GPU"` 等价，`"gpu1"` 与 `"GPU1"` 等价。加载时会把 `config.toml` 里的引用统一改写成
-`platform.toml` 声明的大小写，之后再精确比较，所以 `check` 与 `run` 不会出现
-"检查通过、运行找不到"的偏差。`platform.toml` 里只差大小写的两个键（`CPU_FAN`
-与 `cpu_fan` 并存）会直接报错。SDR 名字还额外忽略分隔符：`CPU_Tctl_Value`、
-`CPU Tctl Value`、`cpu-tctl-value` 视为同一个传感器。
-
-校验项（`fanctl check` 与 `run` 启动时都执行，一次列出全部问题）：
-TOML 语法与未知字段 → 阈值升序 → `debounce_celsius` 必须小于相邻阈值间隔 →
-引脚/传感器必须存在 → 阈值与转速范围 → 联动规则无环、无自引用、两端都被某个分区驱动 →
-`min_duty_cycle ≤ fallback_duty_cycle ≤ max_duty_cycle` →
-**每个分区**的 `fallback_duty_cycle` 不低于它自己的待机档（读不到读数不该比"测到很凉"更安静）→
-`fallback_after_cycles ≥ 1` → 待机档在窗口内且不高于第一档 → 名字大小写冲突 →
-`[sensors]` 不得占用 `GPU` / `GPU<n>`。
-`GPU<n>` 的编号是否存在要连上驱动才知道，属于运行期事实：`check` 会把实际枚举到的
-`GPU0..n` 打出来，编号写错时那个分区会走"无读数"路径（保持上一档并告警），不会 panic。
-
-> `deny_unknown_fields` 是刻意开的：写错字段名会直接报错，而不是安静地用了默认值。
-
----
-
-## 4. 控制算法
-
-### 4.1 采集与聚合
-
-控制循环**不读整张 SDR 表**。`ipmitool sdr` 输出 53 行要 2.9 s，因为每一行都是一次
-Get Sensor Reading 往返；按类型过滤（`sdr type temperature`）也一样慢。
-循环只读 `[sensors]` 里被某个分区引用到的那些，一条一个 `raw 0x04 0x2d <id>`，
-全部命令塞进一个 `ipmitool exec` 进程：
-
-| 读法 | 1 个传感器 | 3 个 | 5 个 |
-|---|---|---|---|
-| `ipmitool sdr`（全表） | 2850 ms | 2850 ms | 2850 ms |
-| 按名字 `sdr get` | 158 ms | 648 ms | ~1000 ms |
-| **`exec` + raw（现在用的）** | **105 ms** | **122 ms** | **155 ms** |
-
-（TYAN S8030 / ipmitool 1.8.19 实测。）
-
-`ipmitool exec` 在某一条失败时不会停下，只是不为它输出——直接按行号对应就会把后面的
-读数错位到别的传感器。所以每条读命令前面都插一条 `raw 0x06 0x01`（Get Device ID，
-固定 15 字节）当分隔符：**空洞就是失败的那条**，其余照常使用。
-
-raw 响应第一个字节是原始读数，第二个字节的 bit 5 表示"无读数"（坏传感器会回
-`00 e0 c0 00`，不能当成 0 ℃）。这里不套用 SDR 记录里的 M/B 系数，所以 `check` 必须
-验证这块板子确实是 1:1，否则整个方案不成立。
-
-非温度（`RPM`、`no reading`、`ns`）记为"没有读数"而不是 0 —— 避免把缺数据的源当成低温。
-GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期会自动重试。
-`"GPU"` 只是 `monitor_sources` 里的一个关键字，与主板 SDR 无关：它把 NVML 下
-所有卡的读数取最高，再作为一个源参与本分区的 `max`/`mean`。
-
-需要只看某一张卡时写 `"GPU0"`、`"GPU1"`……编号就是 NVML 的 device index，
-`check` 会把每个编号对应哪张卡、多少度打出来。典型场景是"两张 4080 共用一个冷排，
-另一张 3080 自带风扇"：冷排分区写 `["GPU1", "GPU2"]`，那张自扇卡满载时就不会把
-冷排一起拉起来。编号由驱动枚举顺序决定，**不换卡、不重装驱动就不会变**；
-两张同型号的卡只能靠编号区分，不要按型号名猜。
-
-`[sensors]` 里不允许再定义 `GPU` 或 `GPU<n>`（加载时直接报错），避免一个名字
-指向两种数据源。
-
-聚合只统计"本周期真有值"的源：`mean` 不会因为没插显卡被拖到 0 ℃。
-
-采集是"每周期一次、一次解析"：`monitor_sources` 在加载期就解析成 `Source` 列表，
-被引用的传感器名、SDR 名、编号也一次性整理好；循环里只遍历这个短列表，不碰字符串、
-不重建切片。`platform.toml` 里声明了却没被任何分区引用的传感器**完全不读**。
-没有任何分区引用 `GPU` 时，连 NVML 都不会打开（否则一个纯 CPU 的机器会每 10 秒
-重试一次 `dlopen("libnvidia-ml.so")`）。
-
-**每周期都会输出一行快照**，这是判断"它还活着吗、现在多热"的唯一入口：
-
-```text
-cycle temps CPU_Tctl=22.0 GPU1=45.0 | fan CPU_FAN=690 SYS_FAN_2=1104 | duty cpu=30 pump=100
-```
-
-三段都是 `key=value`，段首的 `temps` / `fan` / `duty` 是裸词，切开不用猜。IPMI 传感器名
-按字典序排，两次快照才能逐项对比（`HashMap` 的迭代顺序不稳定，不排就等于每周期都在变）。
-一个温度都读不到时 `temps` 后面是 `none`，某个分区读不到则占空比显示 `?`——缺数据要
-看得见，不能悄悄少一列。
-
-频率按**变化**决定，而不是按计数器：
-
-| 情况 | 级别 |
+| what happened | level |
 |---|---|
-| 有温度变化达到 3 ℃（或有传感器出现/消失） | INFO |
-| 没有变化，且距上次 INFO 不满 5 分钟 | DEBUG |
-| 没有变化，但满 5 分钟了（心跳） | INFO |
+| a temperature moved ≥ 3 °C, a fan speed moved ≥ 2 tach counts, or a sensor appeared/vanished | INFO |
+| nothing moved, less than 5 minutes since the last INFO line | DEBUG |
+| nothing moved, but 5 minutes passed | INFO |
+| a driven fan stopped reporting rotation | WARN |
 
-阈值是 3 ℃ 而不是 1 ℃，因为 BMC 只报整数、空载 EPYC 的 Tctl 整天在 22–24 之间
-来回：拿 2 ℃ 当判据实测仍是每分钟三条，等于没限流。**转速不参与**这个判断——转速计
-最后一位本来就在抖（泵常年在 5934↔6072 之间），占空比变化另有自己的日志行。
+So an idle box writes 288 lines a day, a busy one writes a line every 10 s, and
+a dead fan is never silent. `-v` raises the level to DEBUG (every cycle), `-vv`
+to TRACE. Exit code is 0 on a clean shutdown and 1 on a configuration or
+hardware error.
 
-空载机器一天 288 行，负载一动就是 10 s 一行的粒度。这样 `journalctl` 既能当"进程还活着"
-的证据（死掉的进程和稳态进程在日志里长得一模一样，这是踩过的坑），也能直接当温度曲线的
-数据源，而不是撑成一堵墙。
-
-取出来画曲线：
+Draw a temperature curve:
 
 ```bash
 journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
 ```
 
-### 4.2 批量下发 PWM
+## Configuration
 
-写和读走同一套机制。每周期需要改动的引脚（过滤掉"和上次成功下发值相同"的那些）
-合并成**一个** `ipmitool exec` 进程：
+Two files, deliberately separate:
 
-```text
-raw 0x06 0x01                                   # 分隔符
-raw 0x2e 0x44 0xfd 0x19 0x00 0xNN 0x01 0xPP      # 通道 NN ← PP%
-raw 0x06 0x01
-raw 0x2e 0x44 0xfd 0x19 0x00 0xNN 0x01 0xPP
-...
-```
+- `platform.toml` — what the hardware is: pins, sensor numbers, how to talk to
+  it. → [docs/platform.md](docs/platform.md)
+- `config.toml` — what the policy is: zones, curves, coupling, fallbacks.
+  → [docs/config.md](docs/config.md)
 
-| 写法 | 4 个引脚 |
-|---|---|
-| 逐个 `ipmitool raw` | 356 ms |
-| **一次 `exec`（现在用的）** | **125 ms** |
+Both are validated at startup and by `fanctl check`; unknown keys are an error,
+not a silently ignored typo. Names are case-insensitive everywhere.
 
-（TYAN S8030 / ipmitool 1.8.19 实测；单条 `raw` 进程启动就要 90 ms，批量的固定开销 ≈40 ms、
-每个事务 ≈17 ms，所以引脚越多省得越多。）
+## Design
 
-**成功与否看每条命令的应答，不看 `ipmitool` 的退出码。** 写命令成功时回 `fd 19 00`
-（3 字节 ACK），失败时什么都不打印、只在 stderr 留一行；`exec` 遇到失败仍会继续跑后面的命令，
-但整体退出码是 1。因此：
+The interesting parts — aggregation, the curve, merging several zones onto one
+pin, what happens when a sensor dies — are in [docs/design.md](docs/design.md).
+The measured cost of a cycle and where the binary's bytes go are in
+[docs/cost.md](docs/cost.md).
 
-- 槽位非空 = 该引脚确认下发；槽位为空 = 该引脚失败；
-- 整体 `rc != 0` 但有 ACK 的引脚**照样算成功**（换个角度看，rc 只是"至少一条失败"的标志）；
-- 所有槽位都空 = 整批失败（超时、BMC 拒绝、脚本都没跑起来），`Error` 返回，不更新任何"已下发值"；
-- 只有确认成功的引脚才更新"已下发值"，失败的引脚下个周期会重发——
-  不会出现"以为写进去了、其实没有，于是再也不重试"。
+## Contributing
 
-槽位协议与读取完全一致（`src/bmc.rs`，读写在两个模块间共用），所以逐引脚的失败归因是免费的，
-不需要为了"哪一把扇子写失败"再单独发一次命令。`--dry-run` 时整批只记日志，不开进程。
+The most useful contribution is **another board**. `docs/platform.md` documents
+every field and the procedure for finding the numbers; a pull request that adds
+a working `platform.toml` (plus a config demonstrating it) turns this from a
+one-board tool into a general one. Boards whose fan control is not a raw OEM
+command — Dell iDRAC, HPE iLO, Supermicro with a Redfish fan profile — would
+need a different actuator backend, which is a small, well-isolated module.
 
-### 4.3 非对称防抖（快升慢降）
-不引入滑动滤波，只用单侧迟滞，档位 `n` 对应第 `n` 个阈值：
+The second most useful contribution is **another GPU backend**. Temperatures
+currently come from NVML, which covers NVIDIA only. AMD (ROCm SMI) and Intel
+(`xe`/`i915` hwmon) both expose per-card temperatures through other interfaces,
+and a board that publishes GPU temperatures as IPMI sensors needs no new code
+at all — just `[sensors]` entries. The `Source` enum in `src/sensors.rs` is
+where a new backend plugs in.
 
-| 方向 | 条件 | 动作 |
-|------|------|------|
-| 升档 | `温度 >= 阈值` | **立即**切档，可一次跳多档 |
-| 降档 | `温度 <= 当前档阈值 - debounce_celsius` | 降一档 |
-| 跌破第一档 | `温度 <= 第一档阈值 - debounce_celsius` | 直接回 `default_duty_cycle` |
-| 死区内 | 以上都不满足 | 保持当前 PWM 不变 |
+Before sending a patch: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test`. Keep board-specific knowledge out of `src/` — if a
+constant is hardware, it belongs in `platform.toml`. Include the output of
+`fanctl check` and a few `cycle` lines when reporting a control problem; the
+whole point of that log line is to make a remote diagnosis possible.
 
-以 `55/70/85 → 40/60/100 %`、`debounce_celsius=2` 为例：70 ℃ 升到 60 %，要在
-**68 ℃ 才降回 40 %**；但 71 ℃ 会立刻升回 60 %。升温不等，降温不抖。
+## How this was built
 
-**曲线的低端可能没有区分度。** 风扇有最低转速，占空比再往下压转速也不会更低。
-实测某 TYAN S8030（TYAN 原厂扇）：30 % = 690 RPM 就是地板，40 % = 828，
-60 % = 1242，100 % = 1932。所以 `min_duty_cycle` 和待机档若都落在地板以下，
-写 25 还是 30 转速完全一样——**那些数字不生效，不是配置写错了**。想更安静只能改
-BMC 自己的风扇策略（或换扇），fanctl 无法让一把扇子低于它自己的最低转速。
-反过来说，按 30 % 待机是"物理上最安静"的选择，不必再往低调。
+Written with an AI agent doing most of the typing, under a maintainer who
+specified the design and verified every hardware claim on the machine itself:
+which header is which channel, at what duty a fan actually starts turning, that
+`raw 0x04 0x2d` returns a tachometer count rather than RPM, that a coolant pump
+saturates at 90 %. Those facts are in the comments and in these documents
+because they were measured, not because they were assumed — several of the
+first assumptions were wrong and were corrected against the hardware.
 
-### 4.4 合并与兜底（顺序固定）
-1. 各分区算出目标引脚 → **同一引脚取最大值**（绝不覆盖降速）；
-2. `follows` 求不动点（与声明顺序无关）→ `Pwm(A) = max(Pwm(A), Pwm(B))`；
-3. 夹到 `[min_duty_cycle, max_duty_cycle]`；
-4. 只对"与上次**确认**下发值不同"的引脚发指令（BMC 不会被每 10 秒刷一遍），
-   整批发一次 `exec`（见 4.2）。
+What that means for you: the code is small (about 5 000 lines, of which the
+control path is a few hundred), the tests are cheap to run without any
+hardware, and no part of it is magic. It also means the project has exactly one
+maintainer's worth of operational experience, on exactly one board. Treat a
+first deployment the way it was treated here — `check`, then `--dry-run`, then
+watch it.
 
-### 4.5 失败策略
+## License
 
-| 情况 | 反应 |
-|------|------|
-| 某个分区读不到数据，且未超过宽限 | 保持该引脚上一次的转速（不降速） |
-| 该分区连续 `fallback_after_cycles` 个周期都没有任何读数 | 该分区所有引脚 → **本分区的** `fallback_duty_cycle` |
-| 该分区从没读到过数据（刚启动） | 直接 `fallback_duty_cycle`，不等宽限 |
-| 一个传感器都读不到（`snapshot` 为空） | 跳过宽限，所有**被分区驱动**的引脚立即 → 各自分区的 `fallback_duty_cycle`（没人管的引脚不碰，理由同退出复位） |
-| `ipmitool` 写失败 / 超时 | 记 Error，**下个周期重试**，不退出；未确认的引脚不更新"已下发值" |
-| BMC 挂住不回 | 单次调用有超时；超时后**杀掉并回收子进程**（连同两个读管道的线程），循环不会被卡死，也不会每周期漏一个进程 |
-| `ipmitool` 根本不存在 | 报 `IpmitoolMissing`，与"BMC 超时"区分——这一类不会自愈，`check` 直接失败 |
-| SIGINT / SIGTERM | 每个被驱动的引脚 → 所属分区 `default_duty_cycle`（整批一次 `exec`），然后退出 0 |
-
-宽限的意义是"抖一下不至于改转速"：BMC 偶发一次没回，风扇不该立刻从中档爬到兜底档再爬回来。
-`fallback_after_cycles = 2` 配 10 s 周期，等于连续 20 s 完全没数据才降档。
-水泵这类"读不到也必须满转"的设备用分区覆盖解决——`fallback_duty_cycle = 100` 与
-`default_duty_cycle = 100` 相同，宽限和兜底都不改变它的输出。
-
----
-
-## 5. 安全须知
-
-1. **先 `check`，再 `--dry-run`，最后才正式跑。** `check` 会真跑一次整张 SDR 表、逐个
-   `ipmitool sdr get`，再做一次批量 raw 读，确认 `[sensors]` 里的名字、编号、读数三者
-   互相吻合；不一致就判失败，不会带着一个错的编号进入控制循环。
-2. **引脚 id 只做了语法校验**。要确证 `0x00` 就是 CPU_FAN，只能实际写一次再听声音/看转速；
-   `check` 只能按名称猜（猜不到会给 `[warn]`，不是错误）。第一次正式跑建议单独盯一次
-   `journalctl -u fanctl -f`，确认"改的是哪把扇子"。
-3. `min_duty_cycle ≥ 1` 是硬约束，配置里写 0 会直接报错。
-4. 进程退出时 BMC 保留最后一次写入的值，所以 `SIGTERM` 会把每个被驱动的引脚写回
-   所属分区的 `default_duty_cycle`；**没有任何分区驱动的引脚不会被碰**（daemon 从没写过它，
-   退出时也不该凭空塞一个值，`check` 会给出 `[warn]`）。
-   `TimeoutStopSec` 必须覆盖最坏情况 **`3 × command_timeout_seconds`**：收到信号时可能还有
-   一轮在跑的读（1×）+ 这一轮的批量写（1×），加上退出复位的那一批写（1×）。
-   批量写让这一项**不再随引脚数增长**（以前是 `(1 + 2N) ×`）；10 s 默认值下 30 s 足够，
-   `packaging/fanctl.service` 里给的 120 s 有充足余量。
-5. `ipmitool` 需要 root（或 udev 规则 + `CAP_SYS_RAWIO`）；unit 里刻意**没有**加
-   `PrivateDevices=yes` 这类会屏蔽 `/dev/ipmi*` 的选项。
-6. BIOS 里若把风扇策略设成 "Full Speed" 或某些 BMC 会在重启后重置 PWM，
-   需要相应的 `ipmi` 初始化或接受"重启后由 daemon 下一个周期纠正"。
-
----
-
-## 6. 已知限制 / 后续可做
-
-- **没有 SIGHUP 热重载**：改配置需 `systemctl restart`（有意为之，配置错误时不会带着半套参数跑）。
-- **`command_timeout_seconds` 默认 10 s 是按实测定的**：BMC 读全表常常要 2～3 s（TYAN S8030
-  实测 2.9 s，满负载时抖到 6 s），给 10 才有余量。周期是"含本轮耗时的周期"，
-  但 SDR 读取时间超过 `interval_seconds` 时循环会变成连续采样，日志里会出现
-  "cycle overran the interval"。
-- **状态不落盘**：重启后从当前温度重新定档（升温路径本来就无防抖，不会因此过热）。
-- 引脚存在性只能启发式核对（见安全须知第 2 条）。
-- 若要支持多块板/多套策略：`platform.toml` 已经解耦，加个 `--platform` 切换即可。
-
----
-
-## 7. 开发
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release            # 需要 GPU 支持
-cargo build --release --no-default-features   # 无 NVIDIA 驱动的机器
-```
-
-- Edition 2021，`rust-version = "1.84"`。这个下限不是语言特性要求的，而是 `resolver = "3"`
-  （MSRV 感知的依赖解析）的下限：更老的 cargo 连 manifest 都读不进去。部署时用 rustup 的 stable
-  即可。`Cargo.lock` 入库，保证部署可复现。
-- `#![forbid(unsafe_code)]`；`[lints.clippy] all = "warn"`。
-- **release 用 `panic = "abort"`**：这个 crate 没有 `catch_unwind`，生产代码里也没有
-  `unwrap` / `expect` / `panic!`，会让栈展开的唯一场合是"打了个不该有的 bug"——此时进程
-  无论如何都要死（风扇恢复只走 SIGINT/SIGTERM，两条路都不经过 panic）。改 abort 后，
-  每条 unwind 清理路径、`.eh_frame`、`.gcc_except_table` 都不再生成，实测体积 −29%。
-  代价是 panic 时只打印 `panicked at src/…:line:col`，没有符号化调用栈；需要栈时临时重编：
-  `cargo build --release --config 'profile.release.panic="unwind"'`。
-- 所有需要硬件才能验证的东西都被推到边界：`ipmi::parse_sdr`、`curve`、`merge` 全是纯函数，
-  测试不依赖 BMC、不依赖 GPU。
+GPL-3.0-or-later. See [LICENSE](LICENSE).
