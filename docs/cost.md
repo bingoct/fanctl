@@ -88,38 +88,38 @@ protocol answers that for free.
 
 ## Binary size
 
-1 505 240 bytes (1.44 MiB), stripped, `lto = "thin"`, `codegen-units = 1`,
+1 505 464 bytes (1.44 MiB), stripped, `lto = "thin"`, `codegen-units = 1`,
 `panic = "abort"`. Linked against libc and libgcc_s only.
 
 | Section | Bytes | Share of file |
 |---|---|---|
-| `.text` (code) | 1 200 550 | **79.8 %** |
-| `.rodata` (constants, strings, tables) | 90 638 | 6.0 % |
-| `.eh_frame` + `.eh_frame_hdr` (unwind tables) | 99 344 | 6.6 % |
+| `.text` (code) | 1 200 774 | **79.8 %** |
+| `.rodata` (constants, strings, tables) | 90 630 | 6.0 % |
+| `.eh_frame` + `.eh_frame_hdr` (unwind tables) | 99 352 | 6.6 % |
 | `.rela.dyn` (dynamic relocations) | 57 456 | 3.8 % |
 | `.gcc_except_table` | 5 860 | 0.4 % |
-| headers, symbols-free metadata, alignment | ~51 000 | ~3.4 % |
+| headers, symbol-free metadata, alignment | ~51 400 | ~3.4 % |
 
 ### Where the code comes from
 
 Attributing every `.text` symbol to the crate that defined it (demangled names,
-1 194 326 bytes accounted for):
+1 194 564 bytes accounted for):
 
 | Crate | Share of code | What it is |
 |---|---|---|
-| `fanctl` | **17.9 %** | this program, ~5 100 lines |
+| `fanctl` | **17.9 %** | this program, ~5 200 lines |
 | `clap_builder` | 17.9 % | command-line parsing |
-| `core` | 14.5 % | `Option`, iterators, formatting |
-| `std` | 9.9 % | the standard library |
-| `toml_edit` | 8.3 % | TOML parsing (via `toml`) |
-| `alloc` | 6.9 % | allocation |
+| `core` | 14.2 % | `Option`, iterators, formatting |
+| `std` | 9.5 % | the standard library |
+| `toml_edit` | 8.2 % | TOML parsing (via `toml`) |
+| `alloc` | 6.5 % | allocation |
 | `gimli`, `addr2line`, `rustc_demangle` | 5.7 % | panic backtrace symbolisation |
 | `nvml_wrapper_sys` | 4.6 % | NVIDIA driver bindings |
-| unattributed (generic instantiations) | 3.5 % | glue with no crate in the symbol name |
+| unattributed | 2.8 % | glue with no crate in the symbol name |
 | `winnow` | 2.1 % | parser combinators, under `toml` |
 | `tracing_subscriber` | 1.9 % | the logging pipeline |
 | `hashbrown` | 1.5 % | `HashMap` |
-| ~20 smaller crates | 5.3 % | `signal-hook`, `miniz_oxide`, `strsim`, … |
+| ~45 smaller crates | 7.2 % | `signal-hook`, `miniz_oxide`, `strsim`, … |
 
 Three things follow, and two of them are why the release profile looks the way
 it does.

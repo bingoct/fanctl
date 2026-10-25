@@ -62,15 +62,12 @@ mod imp {
         /// up on the next cycle.
         pub fn read(&mut self) -> Result<Vec<(u32, String, f64)>, GpuError> {
             if self.nvml.is_none() {
-                match init_nvml() {
-                    Ok(nvml) => self.nvml = Some(nvml),
-                    Err(err) => return Err(err),
-                }
+                self.nvml = Some(init_nvml()?);
             }
-            let nvml = match self.nvml.as_ref() {
-                Some(nvml) => nvml,
-                None => return Err(GpuError::Init("handle not initialised".to_string())),
-            };
+            let nvml = self
+                .nvml
+                .as_ref()
+                .ok_or_else(|| GpuError::Init("handle not initialised".to_string()))?;
 
             let count = nvml
                 .device_count()

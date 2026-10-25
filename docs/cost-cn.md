@@ -79,37 +79,37 @@ raw 0x04 0x2d 0x60                              # CPU_FAN 转速
 
 ## 二进制体积
 
-1 505 240 字节（1.44 MiB），已 strip，`lto = "thin"`、`codegen-units = 1`、
+1 505 464 字节（1.44 MiB），已 strip，`lto = "thin"`、`codegen-units = 1`、
 `panic = "abort"`。除 libc 和 libgcc_s 外静态链接。
 
 | 分区 | 字节 | 占文件 |
 |---|---|---|
-| `.text`（代码） | 1 200 550 | **79.8 %** |
-| `.rodata`（常量、字符串、表） | 90 638 | 6.0 % |
-| `.eh_frame` + `.eh_frame_hdr`（栈展开表） | 99 344 | 6.6 % |
+| `.text`（代码） | 1 200 774 | **79.8 %** |
+| `.rodata`（常量、字符串、表） | 90 630 | 6.0 % |
+| `.eh_frame` + `.eh_frame_hdr`（栈展开表） | 99 352 | 6.6 % |
 | `.rela.dyn`（动态重定位） | 57 456 | 3.8 % |
 | `.gcc_except_table` | 5 860 | 0.4 % |
-| 文件头、节头、对齐 | ~51 000 | ~3.4 % |
+| 文件头、节头、对齐 | ~51 400 | ~3.4 % |
 
 ### 代码从哪来
 
-把每个 `.text` 符号按定义它的 crate 归类（demangle 后共归到 1 194 326 字节）：
+把每个 `.text` 符号按定义它的 crate 归类（demangle 后共归到 1 194 564 字节）：
 
 | Crate | 占代码 | 是什么 |
 |---|---|---|
-| `fanctl` | **17.9 %** | 本程序，约 5 100 行 |
+| `fanctl` | **17.9 %** | 本程序，约 5 200 行 |
 | `clap_builder` | 17.9 % | 命令行解析 |
-| `core` | 14.5 % | `Option`、迭代器、格式化 |
-| `std` | 9.9 % | 标准库 |
-| `toml_edit` | 8.3 % | TOML 解析（经 `toml`） |
-| `alloc` | 6.9 % | 内存分配 |
+| `core` | 14.2 % | `Option`、迭代器、格式化 |
+| `std` | 9.5 % | 标准库 |
+| `toml_edit` | 8.2 % | TOML 解析（经 `toml`） |
+| `alloc` | 6.5 % | 内存分配 |
 | `gimli`、`addr2line`、`rustc_demangle` | 5.7 % | panic backtrace 的符号化 |
 | `nvml_wrapper_sys` | 4.6 % | NVIDIA 驱动绑定 |
-| 无法归因（泛型实例） | 3.5 % | 符号名里没有 crate 的胶水 |
+| 无法归因 | 2.8 % | 符号名里没有 crate 的胶水 |
 | `winnow` | 2.1 % | 解析器组合子，在 `toml` 下面 |
 | `tracing_subscriber` | 1.9 % | 日志管道 |
 | `hashbrown` | 1.5 % | `HashMap` |
-| 约 20 个更小的 crate | 5.3 % | `signal-hook`、`miniz_oxide`、`strsim`…… |
+| 约 45 个更小的 crate | 7.2 % | `signal-hook`、`miniz_oxide`、`strsim`…… |
 
 由此有三点结论，其中两点正是 release profile 长成现在这样的原因。
 

@@ -655,10 +655,10 @@ mod tests {
     use super::{cycle_line, fans_moved, stalled, temperatures_moved};
     use crate::sensors::SensorSnapshot;
 
-    type Duties<'a> = std::vec::IntoIter<(&'a str, Option<u8>)>;
-
-    fn duties(pairs: &[(&'static str, Option<u8>)]) -> Duties<'static> {
-        pairs.to_vec().into_iter()
+    fn duties(
+        pairs: &'static [(&'static str, Option<u8>)],
+    ) -> impl Iterator<Item = (&'static str, Option<u8>)> {
+        pairs.iter().copied()
     }
 
     #[test]
