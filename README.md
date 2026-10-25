@@ -47,7 +47,7 @@ libgcc_s, no runtime, 2 threads, 8 MB resident without the NVIDIA driver
 loaded. `panic = "abort"`, `#[forbid(unsafe_code)]`, no `unwrap` in production
 code.
 
-Status: 122 tests, clean `clippy -D warnings` and `rustfmt`, all on Linux. The
+Status: 124 tests, clean `clippy -D warnings` and `rustfmt`, all on Linux. The
 acceptance run on a TYAN S8030GM2NE (EPYC 7413, 3 GPUs) covered `check` against
 the real BMC, a 5-minute dry run, ten minutes of live control and a `SIGTERM`
 restore; the daemon has been running there as a systemd service since. Read

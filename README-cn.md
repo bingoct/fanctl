@@ -37,7 +37,7 @@ BMC 的原始应答：一个读数 88 ms，七个 183 ms。写入同样批处理
 2 个线程，不加载 NVIDIA 驱动时常驻 8 MB。`panic = "abort"`、`#![forbid(unsafe_code)]`、
 生产代码零 `unwrap`。
 
-状态：Linux 上 122 个测试、`clippy -D warnings` 与 `rustfmt` 全绿。在 TYAN
+状态：Linux 上 124 个测试、`clippy -D warnings` 与 `rustfmt` 全绿。在 TYAN
 S8030GM2NE（EPYC 7413 + 3 张显卡）上的验收覆盖了：对真机跑 `check`、5 分钟 dry-run、
 10 分钟正式控制、`SIGTERM` 复位；此后一直以 systemd 服务形式运行。把它指向你在意的
 机器之前，请先读 [安全与边界](docs/design-cn.md#安全与边界)。
