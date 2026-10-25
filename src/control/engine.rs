@@ -82,6 +82,55 @@ fn temperatures(snapshot: &SensorSnapshot) -> Vec<(String, f64)> {
     temps
 }
 
+/// `true` when a fan speed moved by more than the tachometer can resolve.
+///
+/// Unlike the temperature step this threshold is not chosen, it is derived: the
+/// BMC counts tach pulses over a fixed window and reports the count, so every
+/// reading is a multiple of one count's worth of RPM (138 on a TYAN S8030). A
+/// pump at 100 % alternates between 5934 and 6072 forever - exactly one count,
+/// and no news at all. Two counts is a real change.
+///
+/// The speeds are worth watching even though nothing in the control path reads
+/// them, because they are the only *measured* half of the pair: the duty cycle
+/// says what was asked of the header, the speed says what the fan did with it.
+/// A fan that died, a cable that came loose or a header that lost its rail is
+/// invisible in the duty cycle and obvious here.
+///
+/// A pin that appears or disappears counts too, for the same reason a missing
+/// sensor does.
+fn fans_moved(previous: Option<&[(String, u32)]>, current: &[(String, u32)], step: u32) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.len() != current.len()
+        || current
+            .iter()
+            .zip(previous)
+            .any(|((pin, rpm), (was_pin, was))| pin != was_pin || rpm.abs_diff(*was) > step)
+}
+
+/// Fans that turned last cycle and report nothing this cycle.
+///
+/// `0` is not a speed, it is the absence of one - a stopped rotor, a fan that
+/// is no longer plugged in, or a header with no power. No fan on a running
+/// machine reads zero at a non-zero duty cycle, which is why the caller also
+/// checks that a duty cycle was actually written for the pin.
+fn stalled<'a>(previous: Option<&[(String, u32)]>, current: &'a [(String, u32)]) -> Vec<&'a str> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    current
+        .iter()
+        .filter(|(pin, rpm)| {
+            *rpm == 0
+                && previous
+                    .iter()
+                    .any(|(was_pin, was)| was_pin == pin && *was > 0)
+        })
+        .map(|(pin, _)| pin.as_str())
+        .collect()
+}
+
 /// `true` when the cycle line is worth emitting at INFO.
 ///
 /// Nothing to compare against (first cycle) counts as a change. A sensor that
@@ -158,11 +207,14 @@ pub struct Engine {
     /// Consecutive cycles each zone has gone without a reading.
     zone_misses: Vec<u32>,
     last_sent: BTreeMap<String, u8>,
-    /// Temperatures as of the last reported cycle line - the comparison that
-    /// keeps an idle machine from logging every ten seconds - and when that
-    /// line was last sent at INFO.
+    /// Temperatures and fan speeds as of the last reported cycle line - the
+    /// comparison that keeps an idle machine from logging every ten seconds -
+    /// and when that line was last sent at INFO.
     last_temperatures: Option<Vec<(String, f64)>>,
+    last_fans: Option<Vec<(String, u32)>>,
     last_report_at: Option<Instant>,
+    /// One tachometer count in RPM, the resolution of every speed reading.
+    tach_step: u32,
     /// Pins at least one zone drives; the only ones the daemon may write.
     driven: Vec<String>,
     shutdown: Arc<AtomicBool>,
@@ -188,6 +240,15 @@ impl Engine {
             .into_iter()
             .map(str::to_string)
             .collect();
+        // Validation only lets `rpm_per_count` be absent when no tachometer is
+        // declared, in which case `fans` stays empty and the step is unused.
+        let tach_step = loaded
+            .platform
+            .info
+            .rpm_per_count
+            .unwrap_or(1.0)
+            .round()
+            .max(1.0) as u32;
 
         Self {
             platform: loaded.platform,
@@ -199,7 +260,9 @@ impl Engine {
             zone_misses: vec![0; zone_count],
             last_sent: BTreeMap::new(),
             last_temperatures: None,
+            last_fans: None,
             last_report_at: None,
+            tach_step,
             driven,
             shutdown,
             timeout,
@@ -506,14 +569,11 @@ impl Engine {
     /// Emits the per-cycle temperature line.
     ///
     /// Rate limited by *change* rather than by a counter: a line whose
-    /// temperatures did not move by [`REPORT_STEP_CELSIUS`] is logged at DEBUG,
-    /// and repeated at INFO once [`HEARTBEAT`] has passed. The first cycle
-    /// always reports.
+    /// temperatures and fan speeds did not move is logged at DEBUG, and repeated
+    /// at INFO once [`HEARTBEAT`] has passed. The first cycle always reports.
     ///
     /// This is the daemon's only routine statement that it is still turning,
-    /// and the only source a temperature curve can be drawn from. The fan
-    /// speeds themselves need no separate heartbeat: every write is confirmed
-    /// by the BMC's ACK, and a tachometer reading is the BMC's own business.
+    /// and the only source a temperature curve can be drawn from.
     fn report_cycle(&mut self, snapshot: &SensorSnapshot) {
         let line = cycle_line(
             snapshot,
@@ -524,12 +584,29 @@ impl Engine {
                 .zip(self.zone_duties.iter().copied()),
         );
 
-        // Only temperatures decide "changed". Fan speeds flicker by one tach
-        // count all the time and the duty cycle has its own log line, so
-        // comparing the whole line would report an idle machine every cycle -
-        // measured: 4 lines in 45 s on a box sitting at 22 C.
         let temps = temperatures(snapshot);
-        let moved = temperatures_moved(self.last_temperatures.as_deref(), &temps);
+        let fans = snapshot.fans.clone();
+
+        // A fan that stops turning gets a line of its own even though the cycle
+        // line shows the zero: the line is rate limited and easy to skim past,
+        // and this is the one failure the duty cycles cannot show. Only pins
+        // that were actually driven can stall - a pin is never written a zero
+        // duty cycle, so a speed of zero there is always unexpected.
+        for pin in stalled(self.last_fans.as_deref(), &fans) {
+            if self.last_sent.get(pin).copied().unwrap_or(0) > 0 {
+                warn!(
+                    pin = %pin,
+                    duty_cycle = self.last_sent.get(pin),
+                    "fan reported rotation last cycle and none now"
+                );
+            }
+        }
+
+        // The threshold differs per kind: a BMC reads whole degrees, so only a
+        // move above the idle flicker is news, while speed is quantised by the
+        // tachometer and one count of that quantisation is always flicker.
+        let moved = temperatures_moved(self.last_temperatures.as_deref(), &temps)
+            || fans_moved(self.last_fans.as_deref(), &fans, self.tach_step);
         let due = self
             .last_report_at
             .is_none_or(|at| at.elapsed() >= HEARTBEAT);
@@ -541,6 +618,7 @@ impl Engine {
 
         info!("{line}");
         self.last_temperatures = Some(temps);
+        self.last_fans = Some(fans);
         self.last_report_at = Some(Instant::now());
     }
 
@@ -561,7 +639,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{cycle_line, temperatures_moved};
+    use super::{cycle_line, fans_moved, stalled, temperatures_moved};
     use crate::sensors::SensorSnapshot;
 
     type Duties<'a> = std::vec::IntoIter<(&'a str, Option<u8>)>;
@@ -658,5 +736,72 @@ mod tests {
     #[test]
     fn the_first_cycle_always_reports() {
         assert!(temperatures_moved(None, &temps(&[("CPU_Tctl", 22.0)])));
+    }
+
+    fn fans(pairs: &[(&str, u32)]) -> Vec<(String, u32)> {
+        pairs
+            .iter()
+            .map(|(pin, rpm)| ((*pin).to_string(), *rpm))
+            .collect()
+    }
+
+    /// One tachometer count on the machine this was written for.
+    const STEP: u32 = 138;
+
+    #[test]
+    fn one_tachometer_count_is_not_a_change() {
+        // The pump at 100 % alternates between 5934 and 6072 forever. Both are
+        // 43 and 44 counts of 138 RPM, so this is quantisation, not motion -
+        // reporting it logged four lines in 45 s on an idle machine.
+        let previous = fans(&[("SYS_FAN_4", 5934), ("CPU_FAN", 690)]);
+        assert!(!fans_moved(
+            Some(&previous),
+            &fans(&[("SYS_FAN_4", 6072), ("CPU_FAN", 690)]),
+            STEP
+        ));
+    }
+
+    #[test]
+    fn two_tachometer_counts_is_a_change() {
+        // A real step: 1104 -> 1380 is one header being driven harder.
+        let previous = fans(&[("SYS_FAN_2", 1104)]);
+        assert!(fans_moved(
+            Some(&previous),
+            &fans(&[("SYS_FAN_2", 1380)]),
+            STEP
+        ));
+    }
+
+    #[test]
+    fn a_fan_that_stops_is_a_change_and_a_stall() {
+        // The case the whole comparison exists for: the duty cycle still says
+        // 30 %, the fan says nothing. Only the measured half can show this.
+        let previous = fans(&[("CPU_FAN", 690)]);
+        let current = fans(&[("CPU_FAN", 0)]);
+        assert!(fans_moved(Some(&previous), &current, STEP));
+        assert_eq!(stalled(Some(&previous), &current), vec!["CPU_FAN"]);
+    }
+
+    #[test]
+    fn a_fan_that_was_already_stopped_does_not_stall_again() {
+        // Otherwise a dead fan would warn on every cycle, which trains the
+        // operator to ignore the one line that matters.
+        let previous = fans(&[("CPU_FAN", 0)]);
+        let current = fans(&[("CPU_FAN", 0)]);
+        assert!(stalled(Some(&previous), &current).is_empty());
+    }
+
+    #[test]
+    fn the_first_cycle_warns_about_nothing() {
+        // Without a previous cycle there is no transition to report; the cycle
+        // line itself carries the zero.
+        assert!(stalled(None, &fans(&[("CPU_FAN", 0)])).is_empty());
+    }
+
+    #[test]
+    fn a_tachometer_that_comes_or_goes_is_a_change() {
+        let previous = fans(&[("CPU_FAN", 690)]);
+        assert!(fans_moved(Some(&previous), &fans(&[]), STEP));
+        assert!(fans_moved(None, &fans(&[("CPU_FAN", 690)]), STEP));
     }
 }
