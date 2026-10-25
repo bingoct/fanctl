@@ -12,7 +12,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use tracing::{error, info, warn};
 
 use self::cli::{Cli, Command};
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, PlatformConfig, SensorSpec};
 use crate::control::{standby_targets, Engine};
 use crate::error::Error;
 use crate::sensors::{gpu, ipmi, Source};
@@ -69,9 +69,10 @@ fn check(cli: &Cli) -> ExitCode {
         platform.info.ipmitool_path.display()
     );
     println!(
-        "[ ok ] {} pin(s), {} sensor(s), {} zone(s), {} follow rule(s)",
+        "[ ok ] {} pin(s), {} sensor(s), {} tachometer(s), {} zone(s), {} follow rule(s)",
         platform.pins.len(),
         platform.sensors.len(),
+        platform.tachometers.len(),
         loaded.policy.zones.len(),
         loaded.policy.follows.len()
     );
@@ -241,6 +242,104 @@ fn check(cli: &Cli) -> ExitCode {
         }
     }
 
+    // Tachometers are reported, never used to decide anything - but a wrong
+    // number or a wrong scale factor would print a confident RPM figure for a
+    // fan nobody is measuring, which is worse than printing nothing.
+    if !platform.tachometers.is_empty() {
+        let scale = platform.info.rpm_per_count.unwrap_or(1.0);
+        let numbers: Vec<u8> = platform.tachometers.values().map(|spec| spec.id).collect();
+        let script = ipmi::build_script(&numbers);
+        let counts = match ipmi::read_sensors(
+            &platform.info.ipmitool_path,
+            &script,
+            numbers.len(),
+            timeout,
+        ) {
+            Ok(batch) => {
+                if let Some(details) = &batch.failure {
+                    println!("[warn] batched tachometer read: {details}");
+                }
+                batch.values
+            }
+            Err(err) => {
+                println!("[fail] batched tachometer read failed: {err}");
+                vec![None; numbers.len()]
+            }
+        };
+
+        let mut counts = counts.into_iter();
+        for (pin, spec) in &platform.tachometers {
+            let count = counts.next().flatten();
+            let detail =
+                match ipmi::read_sensor_detail(&platform.info.ipmitool_path, &spec.sdr, timeout) {
+                    Ok(detail) if detail.found => detail,
+                    Ok(_) => {
+                        missing += 1;
+                        println!(
+                            "[fail] tachometer `{pin}` <- `{}`: the BMC has no sensor with that \
+                             name",
+                            spec.sdr
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        println!("[warn] tachometer `{pin}`: {err}");
+                        continue;
+                    }
+                };
+            if let Some(reported) = detail.number {
+                if reported != spec.id {
+                    missing += 1;
+                    println!(
+                        "[fail] tachometer `{pin}`: platform.toml says 0x{:02x}, but `{}` is \
+                         sensor 0x{:02x} - the reported speed would be another fan's",
+                        spec.id, spec.sdr, reported
+                    );
+                    continue;
+                }
+            }
+
+            // `sdr` prints the fan's own unit, so this is RPM; the raw read
+            // returns the count that the SDR coefficients would have scaled.
+            match (count, detail.celsius) {
+                (Some(count), Some(rpm)) => {
+                    // One count of slack: the two reads are seconds apart and a
+                    // tachometer's last digit flickers.
+                    if (rpm / scale - count).abs() <= 1.0 {
+                        println!(
+                            "[ ok ] tachometer `{pin}` <- `{}` (0x{:02x}) = {rpm} RPM, raw \
+                             {count} x {scale}",
+                            spec.sdr, spec.id
+                        );
+                    } else {
+                        missing += 1;
+                        println!(
+                            "[fail] tachometer `{pin}` (0x{:02x}): raw {count} x rpm_per_count \
+                             {scale} = {} RPM, but `sdr` says {rpm} RPM - [platform].rpm_per_count \
+                             does not match this board",
+                            spec.id,
+                            (count * scale).round()
+                        );
+                    }
+                }
+                (None, _) => {
+                    missing += 1;
+                    println!(
+                        "[fail] tachometer `{pin}` (0x{:02x}): the raw read returned nothing",
+                        spec.id
+                    );
+                }
+                (_, None) => {
+                    missing += 1;
+                    println!(
+                        "[fail] tachometer `{pin}` (0x{:02x}): the BMC reports no reading",
+                        spec.id
+                    );
+                }
+            }
+        }
+    }
+
     let driven: HashSet<&str> = loaded
         .policy
         .zones
@@ -386,17 +485,48 @@ fn verify_sensor_numbers(loaded: &LoadedConfig) -> Vec<String> {
     let timeout = Duration::from_secs(loaded.policy.global.command_timeout_seconds.max(1));
     let mut problems = Vec::new();
 
-    for (semantic, spec) in &platform.sensors {
+    verify_numbers(
+        "[sensors]",
+        platform,
+        platform.sensors.iter(),
+        timeout,
+        &mut problems,
+    );
+    // A tachometer never makes a decision, but a wrong number quietly reports
+    // another fan's speed next to the duty cycle this one was given.
+    verify_numbers(
+        "[tachometers]",
+        platform,
+        platform.tachometers.iter(),
+        timeout,
+        &mut problems,
+    );
+
+    problems
+}
+
+/// Checks every `sdr` name against the number `platform.toml` claims for it.
+///
+/// A wrong number does not fail anywhere at run time: it reads whichever sensor
+/// that number is, and the daemon trusts the reading.
+fn verify_numbers<'a>(
+    section: &str,
+    platform: &PlatformConfig,
+    specs: impl Iterator<Item = (&'a String, &'a SensorSpec)>,
+    timeout: Duration,
+    problems: &mut Vec<String>,
+) {
+    for (name, spec) in specs {
         match ipmi::read_sensor_detail(&platform.info.ipmitool_path, &spec.sdr, timeout) {
             Ok(detail) if !detail.found => problems.push(format!(
-                "[sensors].{semantic}: the BMC has no sensor called `{}`",
+                "{section}.{name}: the BMC has no sensor called `{}`",
                 spec.sdr
             )),
             Ok(detail) => {
                 if let Some(reported) = detail.number {
                     if reported != spec.id {
                         problems.push(format!(
-                            "[sensors].{semantic}: platform.toml says 0x{:02x}, but `{}` is \
+                            "{section}.{name}: platform.toml says 0x{:02x}, but `{}` is \
                              sensor 0x{:02x} - the daemon would read a different sensor",
                             spec.id, spec.sdr, reported
                         ));
@@ -404,14 +534,12 @@ fn verify_sensor_numbers(loaded: &LoadedConfig) -> Vec<String> {
                 }
             }
             Err(err) => warn!(
-                sensor = %semantic,
+                sensor = %name,
                 error = %err,
                 "cannot verify the sensor number right now, continuing without that check"
             ),
         }
     }
-
-    problems
 }
 
 /// Best effort: finds a fan sensor whose name corresponds to the pin name.

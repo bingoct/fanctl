@@ -6,7 +6,7 @@
 目标环境：**Tyan S8030 + AMD EPYC 7413 + NVIDIA GPU**，Linux + systemd。
 硬件差异全部落在 `platform.toml`，控制逻辑里没有一处十六进制常量。
 
-当前状态：`cargo build` / `cargo test`（Linux 上 102 个测试）/ `cargo clippy --all-targets`（零告警）/
+当前状态：`cargo build` / `cargo test`（Linux 上 116 个测试）/ `cargo clippy --all-targets`（零告警）/
 `cargo fmt --check` 全部通过。已在 TYAN S8030GM2NE 真机上完成 `check` → 5 分钟 `--dry-run` →
 10 分钟正式运行的验收（4 个分区、4 个引脚、SIGTERM 复位全部实测），并以 systemd 服务形式接管；
 上机流程见"安全须知"。
@@ -70,7 +70,7 @@ fanctl/
 │   │   ├── defaults.rs        # 两份配置的全部默认值（唯一一处）
 │   │   ├── platform.rs        # platform.toml：引脚 id、传感器名、指令模板
 │   │   └── policy.rs          # config.toml：全局、分区、联动
-│   ├── sensors.rs             # SensorHub、Source、SensorSnapshot
+│   ├── sensors.rs             # SensorHub、Source、SensorSnapshot（温度 + GPU + 转速）
 │   ├── sensors/
 │   │   ├── ipmi.rs            # 批量 raw 读 + sdr 解析（纯函数，可单测）
 │   │   └── gpu.rs             # nvml-wrapper，惰性初始化 + feature 开关
@@ -102,8 +102,10 @@ fanctl/
 | `[platform].name` | 是 | — | 板名，仅用于日志 |
 | `[platform].cmd_template` | 是 | — | `ipmitool` 参数模板，必须含 `{id}` 与 `{pwm}`；`{pwm}` 渲染为 `0xNN` |
 | `[platform].ipmitool_path` | 否 | `ipmitool`（走 `$PATH`） | 建议在服务器上写绝对路径 |
+| `[platform].rpm_per_count` | `[tachometers]` 非空时必填 | — | 一个转速计数等于多少 RPM（SDR 记录里的 M 系数） |
 | `[pins]` | 是，≥1 条 | — | 语义名 → 十六进制引脚 id，必须是 `0x00`–`0xFF` |
 | `[sensors]` | 是，≥1 条 | — | 语义名 → `{ sdr = "…", id = "0xNN" }`；不允许占用 `GPU` / `GPU<n>` |
+| `[tachometers]` | 否 | 空 | 引脚名 → `{ sdr = "…", id = "0xNN" }`，只用于日志里的实测转速 |
 
 `[sensors]` 的每条要写两个值，两者都必须对：
 
@@ -118,6 +120,25 @@ fanctl/
 编号可以从 `ipmitool sdr get '<名字>'` 第一行拿到（`Sensor ID : CPU_Tctl_Value (0x1)`）。
 两个语义名指向同一个编号会在加载期报错；`check` 还会把 raw 读数和 `ipmitool sdr`
 比一遍，差超过 2 ℃ 就判失败——那意味着这块板子的温度不能直接当摄氏度用。
+
+`[tachometers]` 把**实测转速**带进每个周期的日志行（见 4.1）。它只报告，不参与任何决策：
+
+```toml
+[platform]
+rpm_per_count = 138      # 一个计数 = 138 RPM
+
+[tachometers]
+"SYS_FAN_1" = { sdr = "SYS_FAN_1", id = "0x61" }
+```
+
+`raw 0x04 0x2d` 拿到的是**计数**，不是 `ipmitool sdr` 打印的 RPM——M 系数是 `ipmitool`
+在本地折算的，BMC 不管。这块板所有风扇读数都是 138 的整数倍，所以系数是 138；
+`check` 会把 `计数 × 系数` 和 `ipmitool sdr get` 的读数比一遍，差一个计数以上就判失败，
+免得日志里印出一个没人测量过的转速。
+
+键名是**引脚名**，但不必和 `[pins]` 一一对应：水泵改成大 4pin 常供之后不再是 fanctl
+写的引脚，转速线却还插在主板上，这时从 `[pins]` 删掉、在 `[tachometers]` 留着即可。
+转速传感器编号和 PWM 通道号是两套数：`SYS_FAN_1` 写通道 `0x02`，读转速却是 `0x61`。
 
 ### 3.2 `config.toml` — 业务逻辑层
 
@@ -234,6 +255,39 @@ GPUs 走 NVML，句柄惰性初始化：没装卡/驱动在重启时下个周期
 不重建切片。`platform.toml` 里声明了却没被任何分区引用的传感器**完全不读**。
 没有任何分区引用 `GPU` 时，连 NVML 都不会打开（否则一个纯 CPU 的机器会每 10 秒
 重试一次 `dlopen("libnvidia-ml.so")`）。
+
+**每周期都会输出一行快照**，这是判断"它还活着吗、现在多热"的唯一入口：
+
+```text
+cycle temps CPU_Tctl=22.0 GPU1=45.0 | fan CPU_FAN=690 SYS_FAN_2=1104 | duty cpu=30 pump=100
+```
+
+三段都是 `key=value`，段首的 `temps` / `fan` / `duty` 是裸词，切开不用猜。IPMI 传感器名
+按字典序排，两次快照才能逐项对比（`HashMap` 的迭代顺序不稳定，不排就等于每周期都在变）。
+一个温度都读不到时 `temps` 后面是 `none`，某个分区读不到则占空比显示 `?`——缺数据要
+看得见，不能悄悄少一列。
+
+频率按**变化**决定，而不是按计数器：
+
+| 情况 | 级别 |
+|---|---|
+| 有温度变化达到 3 ℃（或有传感器出现/消失） | INFO |
+| 没有变化，且距上次 INFO 不满 5 分钟 | DEBUG |
+| 没有变化，但满 5 分钟了（心跳） | INFO |
+
+阈值是 3 ℃ 而不是 1 ℃，因为 BMC 只报整数、空载 EPYC 的 Tctl 整天在 22–24 之间
+来回：拿 2 ℃ 当判据实测仍是每分钟三条，等于没限流。**转速不参与**这个判断——转速计
+最后一位本来就在抖（泵常年在 5934↔6072 之间），占空比变化另有自己的日志行。
+
+空载机器一天 288 行，负载一动就是 10 s 一行的粒度。这样 `journalctl` 既能当"进程还活着"
+的证据（死掉的进程和稳态进程在日志里长得一模一样，这是踩过的坑），也能直接当温度曲线的
+数据源，而不是撑成一堵墙。
+
+取出来画曲线：
+
+```bash
+journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
+```
 
 ### 4.2 批量下发 PWM
 

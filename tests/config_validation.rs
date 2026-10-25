@@ -503,3 +503,76 @@ fn two_sensors_cannot_share_one_number() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn a_tachometer_without_a_scale_factor_is_rejected() {
+    // Without the factor the raw count is printed as if it were RPM: 7 instead
+    // of 966. That looks like a dead fan, not like a missing setting.
+    let platform = PLATFORM.replace("\nrpm_per_count = 138", "");
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(
+        error.contains("rpm_per_count is required"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_tachometer_scale_factor_must_be_positive() {
+    let platform = PLATFORM.replace("rpm_per_count = 138", "rpm_per_count = 0");
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(
+        error.contains("must be a positive number"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_tachometer_on_an_unknown_pin_is_rejected() {
+    let platform = PLATFORM.replace(
+        r#""CPU_FAN"   = { sdr = "CPU_FAN",   id = "0x60" }"#,
+        "\"CPU_FAN\"   = { sdr = \"CPU_FAN\",   id = \"0x60\" }\n\
+         \"SYS_FAN_9\" = { sdr = \"SYS_FAN_9\", id = \"0x69\" }",
+    );
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(
+        error.contains("is not declared in [pins]"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_tachometer_must_not_reuse_a_temperature_sensor_number() {
+    // 0x01 is CPU_Tctl: reading it as a fan speed would print a temperature in
+    // the fan column, which no reader would question.
+    let platform = PLATFORM.replace(
+        r#""CPU_FAN"   = { sdr = "CPU_FAN",   id = "0x60" }"#,
+        r#""CPU_FAN"   = { sdr = "CPU_FAN",   id = "0x01" }"#,
+    );
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(
+        error.contains("already used by [sensors]"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn the_shipped_platform_declares_a_tachometer_per_pin() {
+    let loaded = load(POLICY);
+    let platform = &loaded.platform;
+    assert_eq!(platform.tachometers.len(), 3);
+    assert!(platform.info.rpm_per_count.is_some());
+}
+
+#[test]
+fn a_platform_without_tachometers_still_loads() {
+    // Speeds are optional: a board that exposes none must not fail validation,
+    // and must not be forced to state a scale factor it cannot use.
+    let platform = PLATFORM
+        .replace("\nrpm_per_count = 138", "")
+        .replace("[tachometers]", "# [tachometers] removed")
+        .replace(r#""CPU_FAN"   = { sdr = "CPU_FAN",   id = "0x60" }"#, "")
+        .replace(r#""SYS_FAN_1" = { sdr = "SYS_FAN_1", id = "0x61" }"#, "")
+        .replace(r#""SYS_FAN_2" = { sdr = "SYS_FAN_2", id = "0x62" }"#, "");
+    let error = load_error_with_platform(&platform, &policy_with(ASCENDING, 2.0));
+    assert!(error.is_empty(), "unexpected error: {error}");
+}

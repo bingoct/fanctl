@@ -22,6 +22,15 @@ pub struct PlatformConfig {
     pub pins: BTreeMap<String, String>,
     /// Semantic sensor name -> how to read it.
     pub sensors: BTreeMap<String, SensorSpec>,
+    /// Pin name -> the tachometer sensor on the same header.
+    ///
+    /// Optional, and independent of `[pins]` on purpose: a pump rewired to
+    /// straight 12 V keeps its tach wire on the board but stops being a pin the
+    /// daemon writes. Speeds are never used to make a decision - they are only
+    /// reported, so that the log can be read against the duty cycle it asked
+    /// for.
+    #[serde(default)]
+    pub tachometers: BTreeMap<String, SensorSpec>,
 }
 
 /// One temperature sensor: its SDR name and its IPMI sensor number.
@@ -30,6 +39,9 @@ pub struct PlatformConfig {
 /// 25 times faster than `ipmitool sdr` on a TYAN S8030), and the name is what
 /// `check` prints, matches against the SDR table, and uses to catch a sensor
 /// that was renumbered by a firmware update.
+///
+/// The same shape describes a tachometer in `[tachometers]`; only the meaning
+/// of the reading differs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SensorSpec {
@@ -61,6 +73,15 @@ pub struct PlatformInfo {
     /// Path to the `ipmitool` executable.
     #[serde(default = "super::defaults::ipmitool_path")]
     pub ipmitool_path: PathBuf,
+    /// Revolutions per minute per raw tachometer count.
+    ///
+    /// The SDR record's M coefficient, which `raw 0x04 0x2d` does not apply.
+    /// Required as soon as `[tachometers]` is not empty, because the raw count
+    /// is meaningless on its own and a wrong scale factor is worse than no
+    /// reading: `check` compares the scaled value against `ipmitool sdr get`
+    /// and fails when they disagree.
+    #[serde(default)]
+    pub rpm_per_count: Option<f64>,
 }
 
 impl PlatformConfig {
@@ -121,6 +142,49 @@ impl PlatformConfig {
         // only differ in case would make one of them unreachable.
         check_unique_names("[pins]", self.pins.keys(), &mut problems);
         check_unique_names("[sensors]", self.sensors.keys(), &mut problems);
+        check_unique_names("[tachometers]", self.tachometers.keys(), &mut problems);
+
+        if !self.tachometers.is_empty() {
+            match self.info.rpm_per_count {
+                None => problems.push(
+                    "[platform].rpm_per_count is required when [tachometers] is not empty: \
+                     a raw tach count is not RPM"
+                        .to_string(),
+                ),
+                Some(scale) if !scale.is_finite() || scale <= 0.0 => problems.push(format!(
+                    "[platform].rpm_per_count must be a positive number, got {scale}"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        let mut tach_ids: HashMap<u8, &str> = HashMap::new();
+        for (pin, spec) in &self.tachometers {
+            // The key is the pin the tachometer belongs to; a pin that does not
+            // exist means the entry reports a fan nothing else knows about.
+            if self.find_pin(pin).is_none() {
+                problems.push(format!(
+                    "[tachometers].{pin}: `{pin}` is not declared in [pins]"
+                ));
+            }
+            if spec.sdr.trim().is_empty() {
+                problems.push(format!("[tachometers].{pin}: sdr must not be empty"));
+            }
+            // Reading a temperature sensor as a fan speed would print a
+            // plausible-looking number in the wrong unit.
+            if let Some(first) = sensor_ids.get(&spec.id) {
+                problems.push(format!(
+                    "[tachometers].{pin}: sensor number 0x{:02x} is already used by [sensors].{first}",
+                    spec.id
+                ));
+            }
+            if let Some(first) = tach_ids.insert(spec.id, pin.as_str()) {
+                problems.push(format!(
+                    "[tachometers]: `{first}` and `{pin}` both use sensor number 0x{:02x}",
+                    spec.id
+                ));
+            }
+        }
 
         // `GPU` and `GPU<n>` are taken by the NVML provider; a sensor of that
         // name would be shadowed in every `monitor_sources` entry, with no
@@ -155,6 +219,17 @@ impl PlatformConfig {
     /// Hexadecimal id configured for `pin`, `None` for an unknown pin.
     pub fn pin_id(&self, pin: &str) -> Option<&str> {
         self.pins.get(pin).map(String::as_str)
+    }
+
+    /// Tachometer of `pin`, matched case-insensitively like every other name.
+    pub fn tachometer(&self, pin: &str) -> Option<&SensorSpec> {
+        let key = self.find_tachometer_key(pin)?;
+        self.tachometers.get(key)
+    }
+
+    /// Declared key of `pin` in `[tachometers]`.
+    fn find_tachometer_key(&self, pin: &str) -> Option<&str> {
+        find_key(&self.tachometers, pin)
     }
 }
 

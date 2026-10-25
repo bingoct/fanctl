@@ -11,6 +11,10 @@ name = "Tyan S8030"
 # {pwm} = duty cycle as a hex byte, e.g. 0x28 for 40 %
 cmd_template = "raw 0x2e 0x44 0xfd 0x19 0x00 {id} 0x01 {pwm}"
 # ipmitool_path = "/usr/bin/ipmitool"   # default: whatever is in $PATH
+# RPM per raw tachometer count, required once [tachometers] is not empty. The
+# SDR record's M coefficient is applied by `ipmitool`, not by the BMC, so the
+# raw read returns a count. Every fan on this board reports a multiple of 138.
+rpm_per_count = 138
 
 [pins]
 "CPU_FAN"   = "0x00"
@@ -31,3 +35,16 @@ cmd_template = "raw 0x2e 0x44 0xfd 0x19 0x00 {id} 0x01 {pwm}"
 "CPU_Tctl"       = { sdr = "CPU_Tctl_Value", id = "0x01" }
 "CPU_MOSFET"     = { sdr = "CPU_MOSFET",     id = "0x20" }
 "SYS_Air_Outlet" = { sdr = "SYS_Air_Outlet", id = "0x31" }
+
+[tachometers]
+# pin -> the fan sensor on the same header. Optional, and reported only: the
+# measured speed appears in the cycle log line next to the duty cycle the
+# daemon asked for, so "the write landed" can be told from "the header drives
+# nothing". Nothing here ever changes a decision.
+#
+# A pin may have a tachometer without any zone driving it (a pump on straight
+# 12 V keeps its tach wire), and the sensor number is independent of the PWM
+# channel: SYS_FAN_1 writes to channel 0x02 but reports on sensor 0x61.
+"CPU_FAN"   = { sdr = "CPU_FAN",   id = "0x60" }
+"SYS_FAN_1" = { sdr = "SYS_FAN_1", id = "0x61" }
+"SYS_FAN_2" = { sdr = "SYS_FAN_2", id = "0x62" }

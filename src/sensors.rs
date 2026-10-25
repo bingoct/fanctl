@@ -87,6 +87,12 @@ pub struct SensorSnapshot {
     /// unavailable. The index is kept explicitly because a device that fails to
     /// report is skipped, which would otherwise shift every later reading.
     pub gpus: Vec<(u32, String, f64)>,
+    /// Pin name -> measured speed, in the order declared in `[tachometers]`.
+    ///
+    /// Reports only: nothing here ever changes a duty cycle. A fan that stops
+    /// turning is worth *seeing* next to the duty the daemon asked for, but it
+    /// is the BMC's job to raise a threshold event for it.
+    pub fans: Vec<(String, u32)>,
     /// Non fatal problems worth logging.
     pub errors: Vec<String>,
 }
@@ -113,7 +119,11 @@ impl SensorSnapshot {
         }
     }
 
-    /// `true` when not a single reading could be obtained.
+    /// `true` when not a single temperature could be obtained.
+    ///
+    /// Fan speeds deliberately do not count: a cycle that reads tachometers
+    /// but no temperatures still has to fall back, because it cannot decide a
+    /// duty cycle.
     pub fn is_empty(&self) -> bool {
         self.ipmi.is_empty() && self.gpus.is_empty()
     }
@@ -133,12 +143,34 @@ struct WatchedSensor {
     number: u8,
 }
 
+/// A tachometer, read for the log only.
+#[derive(Debug, Clone)]
+struct WatchedTachometer {
+    /// Pin the tachometer belongs to; the key in `[tachometers]`.
+    pin: String,
+}
+
+/// Converts a raw tachometer count into RPM.
+///
+/// `raw 0x04 0x2d` returns the count, not the value `ipmitool sdr` prints: the
+/// SDR record's M coefficient is applied by `ipmitool`, not by the BMC.
+fn counts_to_rpm(count: f64, per_count: f64) -> u32 {
+    // `count` is a byte and `per_count` was validated as positive and finite,
+    // so the cast saturates at `u32::MAX` rather than wrapping.
+    (count * per_count).round() as u32
+}
+
 /// Polls every provider and folds the results into one [`SensorSnapshot`].
 pub struct SensorHub {
     ipmitool: PathBuf,
     /// Only the sensors a zone references. A sensor declared in `platform.toml`
     /// but never watched costs nothing - it is not read at all.
     watched: Vec<WatchedSensor>,
+    /// Tachometers to report. Independent of `watched`: a pin can have one
+    /// without any zone watching it, and vice versa.
+    tachometers: Vec<WatchedTachometer>,
+    /// RPM per raw count; validated positive, so the `unwrap_or` never matters.
+    rpm_per_count: f64,
     /// The `ipmitool exec` command list, built once: the sensor numbers do not
     /// change, so the control loop never formats or allocates it again.
     script: String,
@@ -181,12 +213,28 @@ impl SensorHub {
             }
         }
 
-        let numbers: Vec<u8> = watched.iter().map(|sensor| sensor.number).collect();
+        let mut numbers: Vec<u8> = watched.iter().map(|sensor| sensor.number).collect();
+
+        let mut tachometers = Vec::new();
+        for (pin, spec) in &platform.tachometers {
+            // Validation already rejected an unknown pin; skipping keeps the
+            // control loop running if it ever slips through.
+            let Some(declared) = platform.find_pin(pin) else {
+                continue;
+            };
+            tachometers.push(WatchedTachometer {
+                pin: declared.to_string(),
+            });
+            numbers.push(spec.id);
+        }
+
         let script = ipmi::build_script(&numbers);
 
         Self {
             ipmitool: platform.info.ipmitool_path.clone(),
             watched,
+            tachometers,
+            rpm_per_count: platform.info.rpm_per_count.unwrap_or(1.0),
             script,
             gpu: gpu::GpuMonitor::new(),
             uses_gpu,
@@ -200,8 +248,8 @@ impl SensorHub {
     pub fn collect(&mut self, timeout: Duration) -> SensorSnapshot {
         let mut snapshot = SensorSnapshot::default();
 
-        if !self.watched.is_empty() {
-            let expected = self.watched.len();
+        if !self.watched.is_empty() || !self.tachometers.is_empty() {
+            let expected = self.watched.len() + self.tachometers.len();
             match ipmi::read_sensors(&self.ipmitool, &self.script, expected, timeout) {
                 Ok(batch) => {
                     if let Some(details) = batch.failure {
@@ -209,7 +257,10 @@ impl SensorHub {
                         // already isolated it to a specific sensor below.
                         warn!(error = %details, "ipmitool reported a failed read");
                     }
-                    for (sensor, value) in self.watched.iter().zip(batch.values) {
+                    // One batch, one order: temperatures first, then
+                    // tachometers, exactly as the script was built.
+                    let mut values = batch.values.into_iter();
+                    for (sensor, value) in self.watched.iter().zip(values.by_ref()) {
                         match value {
                             Some(celsius) => {
                                 if !is_plausible(celsius) {
@@ -227,6 +278,18 @@ impl SensorHub {
                                 sensor = %sensor.semantic,
                                 sdr = %sensor.sdr,
                                 "no temperature reading this cycle"
+                            ),
+                        }
+                    }
+                    for (tachometer, value) in self.tachometers.iter().zip(values) {
+                        match value {
+                            Some(count) => snapshot.fans.push((
+                                tachometer.pin.clone(),
+                                counts_to_rpm(count, self.rpm_per_count),
+                            )),
+                            None => debug!(
+                                pin = %tachometer.pin,
+                                "no tachometer reading this cycle"
                             ),
                         }
                     }
@@ -250,7 +313,16 @@ impl SensorHub {
 
 #[cfg(test)]
 mod tests {
-    use super::is_plausible;
+    use super::{counts_to_rpm, is_plausible};
+
+    #[test]
+    fn a_tach_count_scales_to_the_rpm_sdr_prints() {
+        // Measured on a TYAN S8030: `raw 0x04 0x2d 0x61` answers `07 ...` while
+        // `ipmitool sdr get SYS_FAN_1` says 966 RPM.
+        assert_eq!(counts_to_rpm(7.0, 138.0), 966);
+        assert_eq!(counts_to_rpm(44.0, 138.0), 6072);
+        assert_eq!(counts_to_rpm(0.0, 138.0), 0);
+    }
 
     #[test]
     fn normal_server_temperatures_are_plausible() {
