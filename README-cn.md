@@ -2,126 +2,93 @@
 
 [English](README.md) · **简体中文**
 
-服务器风扇控制守护进程，针对"BMC 自带的 Smart Fan 只有吵和热两档"这类主板。
+服务器主板的风扇温控守护进程。针对 BMC 自带风扇控制不可用、或只能在噪音与过热之间
+取舍的主板：从 BMC 读取温度，按分区曲线换算占空比，再写回 BMC。
 
-温度直接从 BMC 经 IPMI 读（NVIDIA 显卡走 NVML），按分区曲线换算成占空比，
-再用 `ipmitool raw` 写回。它为一台泰安 S8030 而写 —— 那块板的 Smart Fan 不是
-起飞就是慢炖 —— 但控制链路里没有一行代码知道这件事：每一个十六进制常量、
-传感器编号和指令模板都在 `platform.toml` 里。
+- 温度来源：BMC 传感器（IPMI raw）、NVIDIA 显卡（NVML）。
+- 控制周期由 `interval_seconds` 决定，参考配置取 10 s。一个周期内所有读数合并为一次
+  `ipmitool exec`，所有写入合并为一次。
+- 主板相关的引脚 id、传感器编号、命令模板、转速系数全部在 `platform.toml` 里，
+  Rust 源码中不含十六进制常量。
 
-```
-cycle temps CPU_Tctl=23.0 GPU0=28.0 GPU1=26.0 | fan CPU_FAN=690 SYS_FAN_1=966 | duty cpu=30 intake=35
-```
+当前落地点是一台 TYAN S8030GM2NE（EPYC 7413 + 3 张显卡），以 systemd 服务形式长期运行。
+换一块主板是换一份 `platform.toml`，不需要改代码。
 
-## 特色
+## 特性
 
-**动态温控，不是固定档位表。** 每个分区一条阶梯曲线 + 非对称迟滞：升温立即
-切档（可一次跳多档），降温要先越过下一档 `debounce_celsius` 才落档。热了马上反应，
-噪音慢一点。见 [设计](docs/design-cn.md#曲线)。
-
-**主板是配置文件，不是分支。** 引脚 id、传感器编号、`ipmitool` 参数模板、转速
-换算系数全在 `platform.toml`。Rust 源码里一个十六进制常量都没有。换一块板是换一个
-文件，不是换一个分支 —— 见 [平台支持](docs/platform-cn.md)。
-
-**分区。** 一个分区回答一个问题（"这几把扇子该多快"），输入可以是任意多个传感器：
-CPU、机箱空气、某一张显卡、一组的平均值。一个引脚被多个分区认领时永远取最大值，
-`[[follows]]` 用来表达"前面板不得比冷排慢"这种约束，而不是堆一堆条件分支。
-见 [设计](docs/design-cn.md#合并)。
-
-**采集走 IPMI raw，不走 `ipmitool sdr`。** 整张 SDR 表每轮 2.9 秒，因为每一行都是
-一次往返。fanctl 只读分区真正引用的传感器，全部塞进一个 `ipmitool exec`，自己解析
-BMC 的原始应答：一个读数 88 ms，七个 183 ms。写入同样批处理 —— 四个引脚 135 ms，
-逐个发是 419 ms。见 [开销](docs/cost-cn.md)。
-
-**Rust，一个小二进制。** 1.44 MiB，除 libc 和 libgcc_s 之外静态链接，无运行时，
-2 个线程，不加载 NVIDIA 驱动时常驻 8 MB。`panic = "abort"`、`#![forbid(unsafe_code)]`、
-生产代码零 `unwrap`。
-
-状态：Linux 上 124 个测试、`clippy -D warnings` 与 `rustfmt` 全绿。在 TYAN
-S8030GM2NE（EPYC 7413 + 3 张显卡）上的验收覆盖了：对真机跑 `check`、5 分钟 dry-run、
-10 分钟正式控制、`SIGTERM` 复位；此后一直以 systemd 服务形式运行。把它指向你在意的
-机器之前，请先读 [安全与边界](docs/design-cn.md#安全与边界)。
+- **动态温控**：每个分区一条阶梯曲线，升温立即跳档（可一次跳多档），降温需越过
+  `debounce_celsius` 才落档。
+- **主板解耦**：`platform.toml` 描述硬件，`config.toml` 描述策略，两者成对校验。
+- **分区**：一个分区的输入可以是任意多个传感器（BMC 传感器、单张显卡、全部显卡的最大值）。
+- **联动**：同一引脚被多个分区引用时取最大占空比；`[[follows]]` 表达引脚之间的固定约束。
+- **采集走 IPMI raw**：不使用 `ipmitool sdr`，只读分区引用到的传感器，7 个读数一次
+  `exec` 用时 183 ms。
+- **失败策略**：分区读不到数据时先保持上一档，连续 `fallback_after_cycles` 个周期后降到
+  `fallback_duty_cycle`；写 PWM 未获 BMC 应答时记日志并在下个周期重发。
+- **Rust 单文件**：1.44 MiB，除 libc 与 libgcc_s 之外静态链接，2 线程，不加载 NVML 时
+  常驻内存 8 MB。
 
 ## 支持平台
 
 | 主板 | 状态 | 说明 |
-|---|---|---|
-| TYAN S8030GM2NE | 已实测 | CPU_FAN + 3 个 SYS_FAN 通道，转速系数 138 RPM/计数，`raw 0x2e 0x44 0xfd 0x19 0x00 <ch> 0x01 <duty>` |
-| 其他有 OEM raw 风扇指令的主板 | 理论上可用 | 需要一份 `platform.toml`；指令模板和传感器编号各家不同 |
+| --- | --- | --- |
+| TYAN S8030GM2NE | 实机验证 | 4 个 PWM 通道，传感器编号 0x60–0x64，转速系数 138 RPM/计数 |
+| 具备 OEM raw 风扇指令的其他主板 | 可用，需自备配置 | 命令模板与传感器编号因厂商而异 |
 
-这个程序说的是通用 IPMI —— 它猜不出来的是厂商私有的 PWM 指令。如果你的板子认
-`raw 0x2e 0x44 …`（多数带 Smart Fan 和手动覆盖的 AST2500/AST2600 板子都认），
-那就只是一次配置工作，[docs/platform-cn.md](docs/platform-cn.md) 把流程写清楚了：
-找传感器编号、映射通道、用闭环证明哪个头是哪把扇子。第一次写入之前 `fanctl check`
-会先对着活着的 BMC 验证一遍映射。
+`[platform]` 的硬件事实只能靠实测获得：PWM 通道号与传感器编号属于两套互不相关的编号，
+通道与物理风扇头的对应关系需要用转速闭环确认。[docs/platform-cn.md](docs/platform-cn.md)
+给出字段说明、查编号的方法和新增主板的步骤。首次写入前 `fanctl check` 会用
+`ipmitool sdr` 交叉核对配置里写的每一个编号。
 
 ## 依赖
 
-- Linux + systemd。没有提供其他 init 集成。
-- `ipmitool` ≥ 1.8，且能访问 `/dev/ipmi0`（root，或给 `CAP_SYS_RAWIO` 的 udev 规则）。
-- 一块接受 raw PWM 指令的 BMC。
-- 编译需要 Rust 1.84+（`resolver = "3"` 的下限）。`Cargo.lock` 入库。
-- 可选：NVIDIA 驱动，用于读显卡温度。没有驱动的机器用 `--no-default-features` 编译。
+- Linux + systemd。
+- `ipmitool` ≥ 1.8，且能打开 `/dev/ipmi0`（root，或授予 `CAP_SYS_RAWIO` 的 udev 规则）。
+- BMC 提供可写的 raw PWM 指令。
+- 编译需要 Rust 1.84 及以上（`resolver = "3"` 的下限）。`Cargo.lock` 已入库。
+- 可选：NVIDIA 驱动与 NVML，用于读取显卡温度；没有驱动时用 `--no-default-features`
+  编译，二进制小 106 KB。
 
 ## 安装
 
-还没有打包，手动编译安装：
+目前没有打包，手动编译安装：
 
 ```bash
-cargo build --release
-cargo build --release --no-default-features    # 机器上没有 NVIDIA 驱动时
+cargo build --release                              # 需要读显卡温度时
+cargo build --release --no-default-features        # 无 NVIDIA 驱动时
 
-sudo install -Dm755 target/release/fanctl          /usr/local/bin/fanctl
-sudo install -Dm644 examples/platform.toml         /etc/fanctl/platform.toml
-sudo install -Dm644 examples/config.toml           /etc/fanctl/config.toml
-```
+sudo install -Dm755 target/release/fanctl    /usr/local/bin/fanctl
+sudo install -Dm644 examples/platform.toml   /etc/fanctl/platform.toml
+sudo install -Dm644 examples/config.toml     /etc/fanctl/config.toml
 
-`examples/` 里是那块已实测主板的参考配置 —— 从它开始，然后读
-[配置](docs/config-cn.md) 按你的硬件改曲线。两份文件是成对校验的，
-`fanctl check` 一次列出全部问题，而不是第一个。
-
-## 使用
-
-三步，按顺序来，每一步都是上一步的超集。
-
-```bash
-# 1. 校验两份配置并探测硬件：读 platform.toml 里写的传感器编号、
-#    和 `ipmitool sdr` 交叉核对、列显卡、做一次批量 raw 读。不写任何值。
-sudo fanctl check
-
-# 2. 跑控制循环但不发任何 PWM 指令。每周期把"本来会写什么"打进日志。
-#    这一步抓的是"曲线写错了"，配置校验器抓不到这个。
-sudo fanctl run --dry-run -v
-
-# 3. 正式运行，前台跑，交给 systemd 托管。
-sudo fanctl run
-```
-
-systemd：
-
-```bash
 sudo install -Dm644 packaging/fanctl.service /etc/systemd/system/fanctl.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
-journalctl -u fanctl -f
 ```
 
-unit 是按 root + 前台进程写的：没有 `PIDFile=`，没有 `PrivateDevices=`（那会
-藏掉 `/dev/ipmi*`），`TimeoutStopSec=120s` 用来兜住退出时的复位写入。
+`examples/` 是 S8030 的参考配置。改用其他主板时，先按
+[docs/platform-cn.md](docs/platform-cn.md) 改写 `platform.toml`，再按
+[docs/config-cn.md](docs/config-cn.md) 调整 `config.toml`。
 
-**日志就是接口。** 每周期一行，按变化限流：
+## 使用
 
-| 发生了什么 | 级别 |
-|---|---|
-| 有温度变化 ≥ 3 ℃、转速变化超过 2 个计数、或有传感器出现/消失 | INFO |
-| 什么都没变，距上次 INFO 不到 5 分钟 | DEBUG |
-| 什么都没变，但满 5 分钟了 | INFO |
-| 被驱动的风扇从转变成不转 | WARN |
+```bash
+# 校验两份配置，并对硬件做一次探测：核对传感器编号、交叉验证 raw 读数、
+# 列出显卡、做一次批量读取。不写任何 PWM。
+sudo fanctl check
 
-所以空载机器一天 288 行，负载一动就是 10 秒一行，而风扇坏了从不会沉默。`-v` 把级别
-降到 DEBUG（每周期都打），`-vv` 到 TRACE。正常退出退出码 0，配置或硬件错误为 1。
+# 跑完整控制循环但不发 PWM 指令，日志里是每周期本应写入的值。
+sudo fanctl run --dry-run -v
 
-画温度曲线：
+# 前台运行，由 systemd 托管。
+sudo fanctl run
+```
+
+日志每周期一行，按温度、转速、传感器增删的变化限流；`-v` 输出每个周期，`-vv` 输出
+TRACE。正常退出返回 0，配置或硬件错误返回 1。日志格式、限流阈值与退出时的复位行为
+见 [docs/design-cn.md](docs/design-cn.md#每周期日志)。
+
+导出温度曲线：
 
 ```bash
 journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
@@ -129,51 +96,45 @@ journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
 
 ## 配置
 
-两份文件，刻意分开：
+| 文件 | 内容 | 文档 |
+| --- | --- | --- |
+| `/etc/fanctl/platform.toml` | 硬件：引脚 id、传感器编号、命令模板、转速系数 | [docs/platform-cn.md](docs/platform-cn.md) |
+| `/etc/fanctl/config.toml` | 策略：分区、曲线、联动、兜底 | [docs/config-cn.md](docs/config-cn.md) |
 
-- `platform.toml` —— 硬件是什么：引脚、传感器编号、怎么跟它说话。
-  → [docs/platform-cn.md](docs/platform-cn.md)
-- `config.toml` —— 策略是什么：分区、曲线、联动、兜底。
-  → [docs/config-cn.md](docs/config-cn.md)
+两份文件在启动时和 `fanctl check` 中校验，未知字段直接报错。名字比较一律不区分大小写。
 
-两份都在启动时和 `fanctl check` 里校验；未知字段直接报错，而不是安静地忽略拼写
-错误。名字一律大小写不敏感。
+## 文档
 
-## 设计
+| 文档 | 内容 |
+| --- | --- |
+| [docs/design-cn.md](docs/design-cn.md) | 一个周期的处理流程、读取协议、聚合方式、曲线与防抖、分区合并、失败策略、日志、安全边界 |
+| [docs/config-cn.md](docs/config-cn.md) | `config.toml` 全部字段与默认值、校验规则、一份完整示例 |
+| [docs/platform-cn.md](docs/platform-cn.md) | `platform.toml` 字段、查传感器编号与 PWM 通道的方法、新增主板 |
+| [docs/cost-cn.md](docs/cost-cn.md) | 读写耗时实测、二进制体积构成、常驻内存、与同类实现的对比 |
 
-聚合方式、曲线、多个分区抢同一个引脚、传感器读不到了会怎样 —— 都在
-[docs/design-cn.md](docs/design-cn.md)。一个周期的实测开销和二进制里那些字节都
-花在哪，在 [docs/cost-cn.md](docs/cost-cn.md)。
+## 开发
 
-## 贡献
+提交前在 Linux 上跑完以下三项（`util/process.rs` 的超时与信号处理不跨平台，Windows
+上的 `cargo test` 不算数）：
 
-**最有用的贡献是另一块主板。** [docs/platform-cn.md](docs/platform-cn.md) 写清了每个
-字段的含义和找编号的流程；一个能用的 `platform.toml`（外加一份演示它的 config）
-就能把这个只能跑一块板的工具变成通用工具。风扇控制不是 raw 厂商指令的板子 ——
-Dell iDRAC、HPE iLO、用 Redfish 风扇策略的超微 —— 需要换一个执行后端，那是一个很小
-且隔离得很干净的模块。
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+npx markdownlint-cli2 "**/*.md"     # 改动文档时
+```
 
-**第二有用的贡献是另一种 GPU 采集后端。** 现在温度来自 NVML，只覆盖 NVIDIA。AMD
-（ROCm SMI）和 Intel（`xe`/`i915` hwmon）都能通过别的接口给出每卡温度；而如果一块
-板子把显卡温度当成 IPMI 传感器发布，那连新代码都不用写 —— 加几条 `[sensors]` 就行。
-新的后端插在 `src/sensors.rs` 的 `Source` 枚举上。
+硬件相关常量一律放 `platform.toml`，不要写进 `src/`。新增 GPU 采集后端的位置是
+`src/sensors.rs` 中的 `Source` 枚举；如果主板的显卡温度已经作为 IPMI 传感器发布，
+则不需要新代码，只加 `[sensors]` 条目。报告控制问题时请附上 `fanctl check` 的输出
+和若干行 `cycle` 日志。
 
-提交补丁之前跑：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
-`cargo test`。硬件知识不要进 `src/` —— 凡是硬件相关的常量都属于 `platform.toml`。
-报控制问题时请附上 `fanctl check` 的输出和几行 `cycle` 日志；那行日志存在的全部意义
-就是让远程诊断成为可能。
-
-## 这个软件是怎么写出来的
-
-**大部分代码由一个 AI agent 敲出来**，设计由一个维护者定，每一条硬件事实都在机器上
-亲自验证过：哪个头对应哪个通道、一把扇子在多少占空比下才开始转、`raw 0x04 0x2d`
-返回的是转速计数而不是 RPM、水泵在 90 % 以上基本饱和。这些事实之所以写在注释和文档里，
-是因为它们被量过，而不是因为被假定 —— 其中有几条最初的假设就是错的，被硬件纠正了。
-
-这对你意味着什么：代码很小（约 5 000 行，其中控制链路只有几百行），测试不需要任何硬件
-就能跑，里面没有魔法。同时也意味着这个项目的运维经验只有一个人、一块板那么多。
-第一次部署请按它当时被对待的方式对待 —— `check`，然后 `--dry-run`，然后盯着它跑。
+本项目大部分代码由 AI agent 完成，设计由维护者确定，硬件事实均在实机上测量：通道与
+风扇头的对应关系、各档占空比对应的实际转速、`raw 0x04 0x2d` 返回的是计数值而非 RPM、
+水泵的转速饱和点。这些数据写在配置注释与文档中。测试覆盖 124 个用例，`clippy` 与
+`rustfmt` 检查通过。运维经验集中在 S8030 这一块主板上，其他主板首次部署请按
+`check` → `--dry-run` → 观察的顺序进行。
 
 ## 许可证
 
-GPL-3.0-or-later。见 [LICENSE](LICENSE)。
+GPL-3.0-or-later，见 [LICENSE](LICENSE)。

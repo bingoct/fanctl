@@ -2,148 +2,108 @@
 
 **English** · [简体中文](README-cn.md)
 
-A fan control daemon for server boards whose BMC has no usable fan curve.
+A fan control daemon for server boards whose BMC fan control is unusable, or
+offers nothing between loud and too hot. It reads temperatures from the BMC,
+converts them to duty cycles through a per-zone curve, and writes the result
+back to the BMC.
 
-It reads temperatures straight off the BMC over IPMI — and NVIDIA GPUs over
-NVML — turns them into duty cycles with a per-zone curve, and writes the result
-back with `ipmitool raw`. Built for a Tyan S8030 whose "Smart Fan" is either a
-jet engine or a slow cook, but nothing in the control path knows about that
-board: every hex constant, sensor number and command template lives in
-`platform.toml`.
+- Temperatures come from BMC sensors (IPMI raw) and NVIDIA GPUs (NVML).
+- The control period is set by `interval_seconds`; the reference configuration
+  uses 10 s. All reads of a cycle share one `ipmitool exec`, all writes share
+  another.
+- Pin ids, sensor numbers, command templates and the tachometer scale live in
+  `platform.toml`. There is no hexadecimal constant in the Rust source.
 
-```
-cycle temps CPU_Tctl=23.0 GPU0=28.0 GPU1=26.0 | fan CPU_FAN=690 SYS_FAN_1=966 | duty cpu=30 intake=35
-```
+The reference deployment is a TYAN S8030GM2NE (EPYC 7413, 3 GPUs), running as a
+systemd service. Porting to another board means writing a `platform.toml`, not
+changing code.
 
 ## Features
 
-**Dynamic control, not a static profile.** A five-step curve per zone with
-asymmetric hysteresis: a rising temperature switches immediately (possibly
-several steps), a falling one has to clear the step below by
-`debounce_celsius` before dropping. Heat gets a reaction, noise gets a delay.
-See [design](docs/design.md#the-curve).
-
-**The board is a configuration file.** Pin ids, sensor numbers, the `ipmitool`
-argument template and the tachometer scale all live in `platform.toml`. There
-is not one hexadecimal constant in the Rust source. Another board means another
-file, not another fork — see [platform support](docs/platform.md).
-
-**Zones.** A zone is one question ("how fast should these fans turn?") answered
-from any number of sensors: CPU, case air, individual GPU, mean over a group.
-One pin can be claimed by several zones and always gets the highest demand, and
-`[[follows]]` expresses plain couplings ("the intake must never be slower than
-the CPU fan") without a tangle of conditionals. See
-[design](docs/design.md#merging).
-
-**IPMI raw, not `ipmitool sdr`.** The whole SDR table costs 2.9 s per poll
-because every row is a round trip. fanctl reads only the sensors a zone
-actually uses, packs every read into a single `ipmitool exec`, and parses the
-BMC's own replies: 94 ms for one sensor, 185 ms for seven. Writes are batched
-the same way — four pins in 135 ms instead of 419 ms. See
-[cost](docs/cost.md).
-
-**Rust, one small binary.** 1.44 MiB, statically linked apart from libc and
-libgcc_s, no runtime, 2 threads, 8 MB resident without the NVIDIA driver
-loaded. `panic = "abort"`, `#[forbid(unsafe_code)]`, no `unwrap` in production
-code.
-
-Status: 124 tests, clean `clippy -D warnings` and `rustfmt`, all on Linux. The
-acceptance run on a TYAN S8030GM2NE (EPYC 7413, 3 GPUs) covered `check` against
-the real BMC, a 5-minute dry run, ten minutes of live control and a `SIGTERM`
-restore; the daemon has been running there as a systemd service since. Read
-[Safety](docs/design.md#safety-and-limits) before pointing it at a machine you
-care about.
+- **Temperature-driven control.** One step curve per zone. A rising temperature
+  jumps immediately, possibly several steps; a falling one must clear
+  `debounce_celsius` before dropping a step.
+- **Board decoupled.** `platform.toml` describes the hardware, `config.toml`
+  describes the policy; the two are validated as a pair.
+- **Zones.** A zone takes any number of inputs: one BMC sensor, a single GPU, or
+  the hottest of all GPUs.
+- **Coupling.** A pin referenced by several zones receives the highest duty
+  cycle; `[[follows]]` adds fixed constraints between pins.
+- **IPMI raw collection.** No `ipmitool sdr` on the hot path. Only the sensors a
+  zone references are read, and seven readings share one `exec` in 183 ms.
+- **Failure policy.** A zone with no reading holds its previous step, and drops
+  to `fallback_duty_cycle` after `fallback_after_cycles` consecutive misses. A
+  PWM write without a BMC acknowledgement is logged and repeated next cycle.
+- **One Rust binary.** 1.44 MiB, statically linked apart from libc and libgcc_s,
+  2 threads, 8 MB resident without NVML loaded.
 
 ## Supported platforms
 
 | Board | Status | Notes |
-|---|---|---|
-| TYAN S8030GM2NE | verified | CPU_FAN + 3 × SYS_FAN headers, tachometer scale 138 RPM/count, `raw 0x2e 0x44 0xfd 0x19 0x00 <ch> 0x01 <duty>` |
-| other boards with an OEM raw fan command | should work | needs a `platform.toml`; the command template and sensor numbers differ per vendor |
+| --- | --- | --- |
+| TYAN S8030GM2NE | verified on hardware | 4 PWM channels, sensor numbers 0x60–0x64, tachometer scale 138 RPM/count |
+| other boards with an OEM raw fan command | usable, needs a config | command template and sensor numbers differ per vendor |
 
-The daemon speaks IPMI generically — what it cannot guess is the vendor's
-private PWM command. If your board answers to `raw 0x2e 0x44 …` (most
-AST2500/AST2600 boards with a "Smart Fan" and a manual override do) it is a
-configuration exercise, and [docs/platform.md](docs/platform.md) walks through
-it: finding sensor numbers, mapping channels, and closing the loop to prove
-which header is which. `fanctl check` verifies the mapping against the live BMC
-before the first write.
+The hardware facts a `platform.toml` needs can only be measured. PWM channel
+numbers and sensor numbers are two unrelated numbering spaces, and the mapping
+from channel to physical header has to be confirmed by watching fan speeds.
+[docs/platform.md](docs/platform.md) documents the fields, how to look the
+numbers up, and how to add a board. Before the first write, `fanctl check`
+cross-checks every number in the file against `ipmitool sdr`.
 
 ## Requirements
 
-- Linux with systemd. Nothing else in the way of init integration is provided.
-- `ipmitool` ≥ 1.8, with permission to reach `/dev/ipmi0` (root, or a udev rule
-  granting `CAP_SYS_RAWIO`).
-- A BMC whose fan channels accept a raw PWM command.
-- Rust 1.84+ to build (`resolver = "3"` needs it). `Cargo.lock` is committed.
-- Optional: the NVIDIA driver, if you want GPU temperatures. Build with
-  `--no-default-features` on a machine without one.
+- Linux with systemd.
+- `ipmitool` ≥ 1.8 with access to `/dev/ipmi0` (root, or a udev rule granting
+  `CAP_SYS_RAWIO`).
+- A BMC that accepts a raw PWM command.
+- Rust 1.84 or later to build (`resolver = "3"`). `Cargo.lock` is committed.
+- Optional: the NVIDIA driver and NVML for GPU temperatures. Build with
+  `--no-default-features` on a host without it; the binary is 106 KB smaller.
 
 ## Install
 
-There are no packages yet. Build and install by hand:
+No packages yet. Build and install by hand:
 
 ```bash
-cargo build --release
-cargo build --release --no-default-features    # no NVIDIA driver on the host
+cargo build --release                              # GPU temperatures wanted
+cargo build --release --no-default-features        # no NVIDIA driver
 
-sudo install -Dm755 target/release/fanctl          /usr/local/bin/fanctl
-sudo install -Dm644 examples/platform.toml         /etc/fanctl/platform.toml
-sudo install -Dm644 examples/config.toml           /etc/fanctl/config.toml
-```
+sudo install -Dm755 target/release/fanctl    /usr/local/bin/fanctl
+sudo install -Dm644 examples/platform.toml   /etc/fanctl/platform.toml
+sudo install -Dm644 examples/config.toml     /etc/fanctl/config.toml
 
-`examples/` carries the reference configuration for the verified board — start
-there, then read [configuration](docs/config.md) and adjust the curve to your
-hardware. Both files are validated as a pair; `fanctl check` reports every
-problem at once instead of the first one.
-
-## Use
-
-Three steps, in this order. Each one is a superset of the previous.
-
-```bash
-# 1. Validate both config files and probe the hardware: reads the sensor
-#    numbers named in platform.toml, cross-checks them against `ipmitool sdr`,
-#    lists the GPUs, and does one batched raw read. Writes nothing.
-sudo fanctl check
-
-# 2. Run the control loop but send no PWM command. Logs exactly what it would
-#    have written, every cycle. This is the step that catches "the curve is
-#    wrong", not the config validator.
-sudo fanctl run --dry-run -v
-
-# 3. Run for real, in the foreground, and let systemd supervise it.
-sudo fanctl run
-```
-
-Under systemd:
-
-```bash
 sudo install -Dm644 packaging/fanctl.service /etc/systemd/system/fanctl.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
-journalctl -u fanctl -f
 ```
 
-The unit is written for root and for a foreground process: no `PIDFile=`, no
-`PrivateDevices=` (it would hide `/dev/ipmi*`), `TimeoutStopSec=120s` to cover
-the restore writes.
+`examples/` holds the reference configuration for the S8030. For another board,
+rewrite `platform.toml` following [docs/platform.md](docs/platform.md), then
+adjust `config.toml` following [docs/config.md](docs/config.md).
 
-Logs are the interface. One line per cycle, rate-limited by change:
+## Use
 
-| what happened | level |
-|---|---|
-| a temperature moved ≥ 3 °C, a fan speed moved ≥ 2 tach counts, or a sensor appeared/vanished | INFO |
-| nothing moved, less than 5 minutes since the last INFO line | DEBUG |
-| nothing moved, but 5 minutes passed | INFO |
-| a driven fan stopped reporting rotation | WARN |
+```bash
+# Validate both files and probe the hardware: check sensor numbers, cross-check
+# raw readings, list the GPUs, do one batched read. Writes no PWM.
+sudo fanctl check
 
-So an idle box writes 288 lines a day, a busy one writes a line every 10 s, and
-a dead fan is never silent. `-v` raises the level to DEBUG (every cycle), `-vv`
-to TRACE. Exit code is 0 on a clean shutdown and 1 on a configuration or
-hardware error.
+# Run the full control loop without sending PWM commands. The log carries what
+# each cycle would have written.
+sudo fanctl run --dry-run -v
 
-Draw a temperature curve:
+# Run in the foreground, supervised by systemd.
+sudo fanctl run
+```
+
+One log line per cycle, rate limited by changes in temperature, fan speed and
+sensor presence. `-v` prints every cycle, `-vv` adds TRACE. Exit code is 0 on a
+clean shutdown, 1 on a configuration or hardware error. The line format, the
+rate limits and the shutdown behaviour are in
+[docs/design.md](docs/design.md#per-cycle-log).
+
+Export the temperature history:
 
 ```bash
 journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
@@ -151,61 +111,50 @@ journalctl -u fanctl -o cat | grep '^cycle ' > cycles.log
 
 ## Configuration
 
-Two files, deliberately separate:
+| File | Content | Documentation |
+| --- | --- | --- |
+| `/etc/fanctl/platform.toml` | hardware: pin ids, sensor numbers, command template, tachometer scale | [docs/platform.md](docs/platform.md) |
+| `/etc/fanctl/config.toml` | policy: zones, curves, coupling, fallbacks | [docs/config.md](docs/config.md) |
 
-- `platform.toml` — what the hardware is: pins, sensor numbers, how to talk to
-  it. → [docs/platform.md](docs/platform.md)
-- `config.toml` — what the policy is: zones, curves, coupling, fallbacks.
-  → [docs/config.md](docs/config.md)
+Both files are validated at startup and by `fanctl check`; unknown keys are an
+error. Names are compared case-insensitively.
 
-Both are validated at startup and by `fanctl check`; unknown keys are an error,
-not a silently ignored typo. Names are case-insensitive everywhere.
+## Documentation
 
-## Design
+| Document | Content |
+| --- | --- |
+| [docs/design.md](docs/design.md) | the cycle, the read protocol, aggregation, curve and debounce, merging, failure policy, logging, safety limits |
+| [docs/config.md](docs/config.md) | every `config.toml` field with defaults, validation rules, a complete example |
+| [docs/platform.md](docs/platform.md) | `platform.toml` fields, finding sensor numbers and PWM channels, adding a board |
+| [docs/cost.md](docs/cost.md) | measured read/write times, binary composition, resident memory, comparison with a similar implementation |
 
-The interesting parts — aggregation, the curve, merging several zones onto one
-pin, what happens when a sensor dies — are in [docs/design.md](docs/design.md).
-The measured cost of a cycle and where the binary's bytes go are in
-[docs/cost.md](docs/cost.md).
+## Development
 
-## Contributing
+Three checks have to pass on Linux before a commit (`util/process.rs` handles
+timeouts and signals with `cfg(unix)`, so `cargo test` on Windows is not
+meaningful):
 
-The most useful contribution is **another board**. `docs/platform.md` documents
-every field and the procedure for finding the numbers; a pull request that adds
-a working `platform.toml` (plus a config demonstrating it) turns this from a
-one-board tool into a general one. Boards whose fan control is not a raw OEM
-command — Dell iDRAC, HPE iLO, Supermicro with a Redfish fan profile — would
-need a different actuator backend, which is a small, well-isolated module.
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+npx markdownlint-cli2 "**/*.md"     # documentation changes
+```
 
-The second most useful contribution is **another GPU backend**. Temperatures
-currently come from NVML, which covers NVIDIA only. AMD (ROCm SMI) and Intel
-(`xe`/`i915` hwmon) both expose per-card temperatures through other interfaces,
-and a board that publishes GPU temperatures as IPMI sensors needs no new code
-at all — just `[sensors]` entries. The `Source` enum in `src/sensors.rs` is
-where a new backend plugs in.
+Hardware constants belong in `platform.toml`, not in `src/`. A new GPU backend
+plugs into the `Source` enum in `src/sensors.rs`; a board that publishes GPU
+temperatures as IPMI sensors needs no code at all, only `[sensors]` entries.
+When reporting a control problem, include the `fanctl check` output and a few
+`cycle` lines.
 
-Before sending a patch: `cargo fmt --check`, `cargo clippy --all-targets -- -D
-warnings`, `cargo test`. Keep board-specific knowledge out of `src/` — if a
-constant is hardware, it belongs in `platform.toml`. Include the output of
-`fanctl check` and a few `cycle` lines when reporting a control problem; the
-whole point of that log line is to make a remote diagnosis possible.
-
-## How this was built
-
-Written with an AI agent doing most of the typing, under a maintainer who
-specified the design and verified every hardware claim on the machine itself:
-which header is which channel, at what duty a fan actually starts turning, that
-`raw 0x04 0x2d` returns a tachometer count rather than RPM, that a coolant pump
-saturates at 90 %. Those facts are in the comments and in these documents
-because they were measured, not because they were assumed — several of the
-first assumptions were wrong and were corrected against the hardware.
-
-What that means for you: the code is small (about 5 000 lines, of which the
-control path is a few hundred), the tests are cheap to run without any
-hardware, and no part of it is magic. It also means the project has exactly one
-maintainer's worth of operational experience, on exactly one board. Treat a
-first deployment the way it was treated here — `check`, then `--dry-run`, then
-watch it.
+Most of the code was written by an AI agent; the design was set by the
+maintainer and every hardware fact was measured on the machine: which channel
+drives which header, the fan speed at each duty step, that `raw 0x04 0x2d`
+returns a tachometer count rather than RPM, where the coolant pump saturates.
+That data is in the configuration comments and in these documents. 124 tests
+pass, `clippy -D warnings` and `rustfmt` are clean. Operational experience is
+limited to one board, so a first deployment on another board should follow
+`check` → `--dry-run` → supervised run.
 
 ## License
 

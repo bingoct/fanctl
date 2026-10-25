@@ -2,9 +2,10 @@
 
 **English** · [简体中文](config-cn.md)
 
-`config.toml` is the policy: how fast the fans should turn for a given
-temperature. It contains no hardware knowledge — every pin and sensor name it
-mentions is resolved through [`platform.toml`](platform.md), case-insensitively.
+`config.toml` holds the policy: how fast the fans should turn at a given
+temperature. It contains no hardware knowledge; every pin and sensor name it
+references is resolved through [`platform.toml`](platform.md),
+case-insensitively.
 
 Related: [design](design.md) · [platform support](platform.md) · [cost](cost.md)
 
@@ -36,70 +37,68 @@ temperature = 84
 duty_cycle = 100
 ```
 
-A zone needs at least one threshold; the curve is the whole policy. Everything
-else is coupling, limits and failure handling.
+A zone needs at least one threshold; the curve is the policy. Everything else is
+coupling, limits and failure handling.
 
-Unknown keys are an error, not a warning — a typo in a field name must not
-quietly fall back to a default.
+Unknown keys are an error, so a misspelled field cannot silently fall back to a
+default.
 
 ## `[global]`
 
 | Key | Required | Default | Meaning |
-|---|---|---|---|
-| `interval_seconds` | yes | — | Sampling period, ≥ 1. The period *includes* the cycle's own work: a 10 s period with a 130 ms read sleeps 9.87 s, it does not sleep 10 s on top. |
+| --- | --- | --- | --- |
+| `interval_seconds` | yes | — | Sampling period, ≥ 1. The period includes the cycle's own work: a 10 s period with a 130 ms read sleeps 9.87 s. |
 | `min_duty_cycle` | yes | — | Hard floor, 1–100. `1` because a stopped server fan is not a supported state. |
 | `max_duty_cycle` | yes | — | Hard ceiling, ≤ 100. |
-| `default_duty_cycle` | yes | — | Standby, used below the first threshold and written back on shutdown. Must be ≤ the first step. |
-| `fallback_duty_cycle` | yes | — | Blind value: what a zone uses when it cannot read anything. Must be ≥ that zone's `default_duty_cycle`. |
+| `default_duty_cycle` | yes | — | Standby value, used below the first threshold and written back on shutdown. Must not exceed the first step. |
+| `fallback_duty_cycle` | yes | — | Value used when a zone cannot read anything. Must be at least the zone's `default_duty_cycle`. |
 | `debounce_celsius` | no | `2.0` | Hysteresis for dropping a step. Must be smaller than the gap to the next threshold. |
 | `aggregation` | no | `max` | `max` or `mean` across a zone's sources. |
 | `fallback_after_cycles` | no | `2` | Consecutive cycles without a reading before a zone drops to `fallback_duty_cycle`. ≥ 1. |
 | `command_timeout_seconds` | no | `10` | Deadline for one `ipmitool` invocation. ≥ 1. |
 
-These are the only five keys in the whole file that may be omitted with a
-default: `debounce_celsius`, `aggregation`, `fallback_after_cycles`,
-`command_timeout_seconds`, and the `ipmitool_path` in `platform.toml`.
-Everything else is either required or inherited from `[global]` into a zone.
+Five keys may be omitted in the whole pair of files: `debounce_celsius`,
+`aggregation`, `fallback_after_cycles`, `command_timeout_seconds`, and
+`ipmitool_path` in `platform.toml`. Every other key is either required or
+inherited from `[global]` into a zone.
 
 ## `[[zones]]`
 
-A zone answers one question — how fast should *these* pins turn — from any
-number of sensors.
+A zone maps a set of sensors to a set of pins.
 
 | Key | Required | Default | Meaning |
-|---|---|---|---|
-| `name` | yes | — | Unique ignoring case. Logs only, but it is what the cycle line shows. |
+| --- | --- | --- | --- |
+| `name` | yes | — | Unique ignoring case. Used in logs, including the cycle line. |
 | `monitor_sources` | yes | — | Non-empty. Each entry is a key of `[sensors]`, or `GPU` / `GPU<n>`. |
 | `target_pins` | yes | — | Non-empty. Each must be declared in `[pins]`. |
 | `thresholds` | yes | — | At least one, strictly ascending by `temperature`. |
 | `aggregation` | no | inherits `[global]` | `max` or `mean`, over the sources that reported this cycle. |
-| `default_duty_cycle` | no | inherits `[global]` | 1–100, and not above the first step. |
-| `fallback_duty_cycle` | no | inherits `[global]` | 1–100, and not below this zone's `default_duty_cycle`. |
+| `default_duty_cycle` | no | inherits `[global]` | 1–100, not above the first step. |
+| `fallback_duty_cycle` | no | inherits `[global]` | 1–100, not below this zone's `default_duty_cycle`. |
 | `fallback_after_cycles` | no | inherits `[global]` | ≥ 1. |
 | `debounce_celsius` | no | inherits `[global]` | ≥ 0, smaller than the gap to the next threshold. |
 
 ### `[[zones.thresholds]]`
 
 | Key | Required | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `temperature` | yes | °C, strictly greater than the previous step. |
-| `duty_cycle` | yes | 1–100. Does not have to ascend, but a curve that drops is almost certainly a mistake. |
+| `duty_cycle` | yes | 1–100. Need not ascend, but a descending curve is almost always a mistake. |
 
-Each step applies from its temperature up to the next one; above the last step
-the last duty cycle holds. Below the first step the zone sits at
-`default_duty_cycle`.
+A step applies from its temperature up to the next one; above the last step the
+last duty cycle holds. Below the first step the zone uses `default_duty_cycle`.
 
 ### Inheritance
 
 Five keys are shared policy: `aggregation`, `default_duty_cycle`,
-`debounce_celsius`, `fallback_duty_cycle`, `fallback_after_cycles`. Written in
-`[global]`, they are the default for every zone; written inside a `[[zones]]`
-block, they override it for that zone.
+`debounce_celsius`, `fallback_duty_cycle`, `fallback_after_cycles`. Declared in
+`[global]` they apply to every zone; declared inside a `[[zones]]` block they
+override the global value for that zone.
 
-Inheritance is resolved once at load time. There is no "look at the global
-value if this one is empty" branch anywhere in the control loop.
+Inheritance is resolved once at load time. The control loop never consults the
+global value.
 
-A water pump is the case worth spelling out:
+A coolant pump uses per-zone overrides for both values:
 
 ```toml
 [global]
@@ -111,7 +110,7 @@ name = "pump"
 monitor_sources = ["Water_Inlet"]
 target_pins = ["SYS_FAN_4"]
 default_duty_cycle = 100    # never runs slow
-fallback_duty_cycle = 100   # and never stops, even when blind
+fallback_duty_cycle = 100   # never stops, even when blind
 
 [[zones.thresholds]]
 temperature = 20
@@ -123,20 +122,17 @@ duty_cycle = 100
 `monitor_sources` accepts three kinds of entry:
 
 | Entry | Reads |
-|---|---|
+| --- | --- |
 | `"CPU_Tctl"`, any `[sensors]` key | that BMC sensor |
 | `"GPU"` | the hottest of every NVIDIA card NVML can see |
-| `"GPU0"`, `"GPU1"`, … | that one card (NVML device index) |
+| `"GPU0"`, `"GPU1"`, … | that card, by NVML device index |
 
-`GPU` is a reserved name; `[sensors]` may not define it. A zone that watches
-`GPU` follows the hottest card, a zone that watches `GPU1` follows one card and
-ignores the rest — the two GPUs under one radiator versus the one with its own
-fans. Indices are the driver's enumeration order and are stable across restarts
-unless cards are moved; `fanctl check` prints index, name and temperature for
-every card so the mapping is visible rather than assumed.
+`GPU` is reserved; `[sensors]` may not define it. Indices follow the driver's
+enumeration order and stay stable across restarts unless cards are moved.
+`fanctl check` prints index, name and temperature for every card.
 
-`mean` averages only the sources that reported this cycle, so an absent GPU
-does not drag a zone towards 0 °C.
+`mean` averages only the sources that reported this cycle, so an absent GPU does
+not pull a zone towards 0 °C.
 
 ## `[[follows]]`
 
@@ -148,19 +144,18 @@ pin = "SYS_FAN_1"
 min_of = "SYS_FAN_2"
 ```
 
-reads as "the intake may never turn slower than the radiator". Both ends must
-be driven by some zone; `pin` may not follow itself; a cycle of rules is
-rejected at load time. Several rules are solved to a fixed point, so the result
-does not depend on the order they are written in. See
-[design](design.md#merging).
+This means "the intake is never slower than the radiator". Both ends must be
+driven by a zone; `pin` may not follow itself; a cycle of rules is rejected at
+load time. Several rules are solved to a fixed point, so the result does not
+depend on the order they are written in. See [design](design.md#merging).
 
 ## Name matching
 
-Names are compared case-insensitively everywhere: `cpu_fan`, `CPU_FAN` and
-`Cpu_Fan` are the same pin, `"gpu"` is `"GPU"`, `"gpu1"` is `"GPU1"`.
+Names are compared case-insensitively: `cpu_fan`, `CPU_FAN` and `Cpu_Fan` are the
+same pin; `"gpu"` is `"GPU"`, `"gpu1"` is `"GPU1"`.
 
 At load time every reference in `config.toml` is rewritten to the spelling
-declared in `platform.toml`, and only then compared exactly — so `check` and
+declared in `platform.toml`, and only then compared exactly, so `check` and
 `run` cannot disagree about which pin was meant. Two keys in `platform.toml`
 that differ only in case are rejected. SDR names additionally ignore
 separators: `CPU_Tctl_Value`, `CPU Tctl Value` and `cpu-tctl-value` are the same
@@ -168,36 +163,33 @@ sensor.
 
 ## Validation
 
-`fanctl check` and the start of `fanctl run` run the same validator and print
-every problem at once:
+`fanctl check` and the start of `fanctl run` run the same validator, which
+reports every problem at once:
 
-- TOML syntax, and unknown keys;
+- TOML syntax and unknown keys;
 - thresholds strictly ascending; `debounce_celsius` smaller than the gap between
   consecutive thresholds;
 - every referenced pin and sensor exists; `[sensors]` does not claim a `GPU`
   name;
-- `min_duty_cycle` ≤ `max_duty_cycle` ≤ 100, and 1 ≤ `min_duty_cycle`;
+- `1 <= min_duty_cycle <= max_duty_cycle <= 100`;
 - every zone's `default_duty_cycle` inside `[min, max]` and not above its first
   step;
-- every zone's `fallback_duty_cycle` inside `[min, max]` **and not below its own
-  `default_duty_cycle`** — a blind reading must never be quieter than a
-  measured cold one;
-- `fallback_after_cycles` ≥ 1, `command_timeout_seconds` ≥ 1,
-  `interval_seconds` ≥ 1;
+- every zone's `fallback_duty_cycle` inside `[min, max]` and not below its own
+  `default_duty_cycle`;
+- `fallback_after_cycles >= 1`, `command_timeout_seconds >= 1`,
+  `interval_seconds >= 1`;
 - `follows`: both ends driven, no self-reference, no cycle;
 - names that collide ignoring case.
 
-`GPU<n>` existence is a runtime fact, not a configuration one: `check` prints
-the cards it found, and a zone referring to a card that is not there follows the
-"no reading" path (hold, then fall back) instead of failing to start.
+Whether `GPU<n>` exists is a runtime fact. `check` prints the cards it found, and
+a zone referring to a missing card follows the "no reading" path (hold, then fall
+back) instead of failing to start.
 
-## A real configuration
+## Example
 
 `examples/config.toml` is a complete, commented file to start from. The policy
-below is the one running on the machine fanctl was written for — a water-cooled
-EPYC with two 4080s on a shared radiator and an air-cooled 3080 — and it is
-worth reading as an example of how the pieces fit rather than as a recommendation
-for yours.
+below runs on the reference machine: a water-cooled EPYC with two 4080s on a
+shared radiator and an air-cooled 3080.
 
 ```toml
 [global]
@@ -303,7 +295,6 @@ pin = "SYS_FAN_1"
 min_of = "SYS_FAN_2"
 ```
 
-Every duty cycle above is a multiple of 5 %, because the BMC quantises PWM
-anyway: on this board 25, 28 and 30 % all produce 828 RPM. Writing 27 would only
-be a lie written in a file. Each step was also read back as RPM after it was
-applied — the curve is the plan, the tachometer is the evidence.
+Every duty cycle above is a multiple of 5 %. The BMC quantises PWM, so on this
+board 25, 28 and 30 % produce the same 828 RPM. Each step was also read back as
+RPM after it was applied.
