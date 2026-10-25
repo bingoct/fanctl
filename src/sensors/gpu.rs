@@ -12,10 +12,10 @@ use thiserror::Error;
 /// exists when the driver's development package is installed. Debian and
 /// Ubuntu ship just the SONAME `libnvidia-ml.so.1`, so a stock host would
 /// otherwise be unable to read any GPU temperature.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
 const NVML_LIB_PATHS: &[&str] = &["libnvidia-ml.so", "libnvidia-ml.so.1"];
 /// Same idea for Windows, where the driver installs `nvml.dll`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "gpu", not(target_os = "linux")))]
 const NVML_LIB_PATHS: &[&str] = &["nvml.dll", "libnvidia-ml.so"];
 
 /// Why no GPU reading could be produced.

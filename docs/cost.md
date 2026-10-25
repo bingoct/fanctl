@@ -84,26 +84,26 @@ protocol answers that per pin.
 
 ## Binary size
 
-1 505 464 bytes (1.44 MiB), stripped, `lto = "thin"`, `codegen-units = 1`,
+1 505 064 bytes (1.44 MiB), stripped, `lto = "thin"`, `codegen-units = 1`,
 `panic = "abort"`. Linked against libc and libgcc_s only.
 
 | Section | Bytes | Share of file |
 | --- | --- | --- |
-| `.text` (code) | 1 200 774 | **79.8 %** |
-| `.rodata` (constants, strings, tables) | 90 630 | 6.0 % |
+| `.text` (code) | 1 200 390 | **79.8 %** |
+| `.rodata` (constants, strings, tables) | 90 614 | 6.0 % |
 | `.eh_frame` + `.eh_frame_hdr` (unwind tables) | 99 352 | 6.6 % |
 | `.rela.dyn` (dynamic relocations) | 57 456 | 3.8 % |
 | `.gcc_except_table` | 5 860 | 0.4 % |
-| headers, symbol-free metadata, alignment | ~51 400 | ~3.4 % |
+| headers, symbol-free metadata, alignment | 51 392 | 3.4 % |
 
 ### Where the code comes from
 
 Attributing every `.text` symbol to the crate that defined it (demangled names,
-1 194 564 bytes accounted for):
+1 194 167 bytes accounted for):
 
 | Crate | Share of code | What it is |
 | --- | --- | --- |
-| `fanctl` | **17.9 %** | this program, ~5 200 lines |
+| `fanctl` | **17.9 %** | this program, ~5 100 lines |
 | `clap_builder` | 17.9 % | command-line parsing |
 | `core` | 14.2 % | `Option`, iterators, formatting |
 | `std` | 9.5 % | the standard library |
@@ -133,7 +133,7 @@ TOML plus its parser combinators account for ~10 %. The configuration is read
 once per process, so this is bought for convenience.
 
 The optional feature is measurable: `--no-default-features` (no NVML, no GPU
-temperatures) builds to **1 399 248 bytes**, 106 KB smaller.
+temperatures) builds to **1 399 024 bytes**, 106 KB smaller.
 
 ## Runtime footprint
 

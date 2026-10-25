@@ -699,7 +699,6 @@ mod tests {
             .collect()
     }
 
-    /// One tachometer count on the machine this was written for.
     #[test]
     fn a_fan_that_stops_is_a_stall() {
         let previous = fans(&[("CPU_FAN", 690)]);
