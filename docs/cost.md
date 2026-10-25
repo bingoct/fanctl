@@ -12,11 +12,11 @@ Related: [design](design.md) · [configuration](config.md) · [platform](platfor
 | Step | Time | Notes |
 | --- | --- | --- |
 | Read every sensor a zone uses (4 temperatures + 3 tachometers) | 183 ms | one `ipmitool exec` |
-| GPUs, first call in the process | 31 ms | `dlopen` of the NVIDIA library |
-| GPUs, afterwards | < 1 ms | 5 µs per device |
+| GPUs, first call in the process | 6 ms | `dlopen` + `nvmlInit`; 31 ms with cold library pages |
+| GPUs, afterwards | 8 µs | three cards, handles cached |
 | Aggregate, curve, merge | microseconds | arithmetic over a handful of values |
 | Write changed pins (4) | 135 ms | one `ipmitool exec`, only when something changed |
-| **Total, steady state** | **~185 ms per 10 s cycle** | 1.8 % of a core, 29 MB resident with GPUs |
+| **Total, steady state** | **~185 ms per 10 s cycle** | 1.8 % of a core, PSS 24–27 MB with GPUs |
 
 CPU time after 7 h 36 min of uptime: **5.5 seconds**, 0.02 % of one core. Idle,
 the process sleeps between cycles and writes nothing.
@@ -137,22 +137,31 @@ temperatures) builds to **1 399 024 bytes**, 106 KB smaller.
 
 ## Runtime footprint
 
-Same binary, two configurations, resident set summed per mapping from `smaps`
-after 40 s of dry-run:
+Resident set counts every page a process has mapped, including pages other
+processes mapped first. Two other numbers separate the two kinds of page.
 
-| GPU source in `config.toml` | RSS | writable | file-backed | threads |
-| --- | --- | --- | --- | --- |
-| no | **3.4 MB** | 204 kB | 3.1 MB | 2 |
-| yes | **28.9 MB** | 21.0 MB | 7.9 MB | 2 |
+**What fanctl allocates** — heap, anonymous pages, stack. Never shared, never
+reclaimable, and the same no matter what else runs on the host.
 
-Without a GPU source the program never calls `nvmlInit`. What is left is the
-program itself: 112 kB of heap, 92 kB of anonymous pages, and 3.1 MB of
-file-backed pages — 1.3 MB of binary, 1.5 MB of libc, the rest the dynamic
-loader and libgcc_s. File-backed pages are shared and reclaimable; the number
-that belongs to fanctl is a few hundred kilobytes.
+**Proportional set size** — divides the shared pages among every process that
+maps them, so libc is charged to fanctl only in part. This one moves with the
+host: measured twice on an idle machine it came out at 1.1 and at 1.7 MB.
 
-With a GPU source, the extra 25 MB is the NVIDIA driver. A 60-line C program
-that links `libnvidia-ml.so.1` and does nothing else shows where it goes:
+| `config.toml` | fanctl allocates | RSS | PSS |
+| --- | --- | --- | --- |
+| no GPU source | **336 kB** | 3.4 MB | 1.1–1.7 MB |
+| GPU source, handle kept | **21.0 MB** | 28.8 MB | 24–27 MB |
+
+Without a GPU source the 336 kB is 112 kB of heap, 96 kB of anonymous pages and
+36 kB of stack, and it does not grow: RSS equals peak RSS on a service that has
+been up for hours. The other 3.1 MB is mapping — 1.3 MB of the binary's code,
+1.5 MB of libc, 220 kB of the loader, 104 kB of libgcc_s — read-only, dropped
+under memory pressure and read back on the next page fault.
+
+With a GPU source there is 19 MB of anonymous driver heap (16 MB of it one
+transparent huge page), plus 4.6 MB of `libcuda.so` and 1.2 MB of
+`libnvidia-ml.so`. A 60-line C program that links the library and does nothing
+else shows where it appears:
 
 | Stage | RSS |
 | --- | --- |
@@ -161,16 +170,33 @@ that links `libnvidia-ml.so.1` and does nothing else shows where it goes:
 | after `nvmlInit` | 26 656 kB |
 | after reading three GPUs | 26 916 kB |
 | after `nvmlShutdown` | 26 904 kB |
+| after `dlclose` | 6 920 kB |
 
-`nvmlInit` allocates it and `nvmlShutdown` does not return it. Reading GPU
-temperature in-process costs this in any program; the alternative is an
-`nvidia-smi` process per sample, which pays the same driver cost plus a process
-start, every cycle.
+`nvmlShutdown` releases the driver's internal state but keeps the mapping, so
+resident memory is unchanged; `dlclose` unmaps the library and 20 MB of driver
+heap goes with it. That makes the choice resident handle or reopen per cycle,
+not resident or not:
 
-RSS and peak RSS (`VmHWM`) are equal on a service that has been up for hours,
-and the heap stays at 132 kB: nothing grows per cycle.
+| | handle kept | reopened every cycle |
+| --- | --- | --- |
+| PSS | 24–27 MB | 3.5 MB |
+| GPU sample | 8 µs | 26.5 ms |
+| `nvmlInit` | 5.5 ms, once | 5.5 ms, every cycle |
+| `dlopen`, `dlclose`, driver setup | 0 | 21 ms, every cycle |
 
-`.workbuddy/scripts/rss-breakdown.sh` reproduces the table. An earlier version of
+fanctl keeps the handle. Reading three cards costs 8 µs against a 185 ms cycle;
+reopening costs 26.5 ms, 14 % of the cycle, to hand the 20 MB of driver heap
+back to the kernel and map it again ten seconds later. On a host without an
+NVIDIA card the answer is `--no-default-features`, which does not link NVML and
+stays at 336 kB.
+
+Virtual size is a different number and a larger one: 404 MB, of which 296 MB
+is anonymous address space the driver reserves for GPU apertures and 110 MB is
+the `libcuda.so` mapping. Reserved address space is not memory; 28.8 MB of it is
+resident, and the rest is never touched.
+
+`.workbuddy/scripts/rss-breakdown.sh` and `nvml-steps.c` reproduce these tables;
+`nvml-residency.c` is the loop behind the reopen column. An earlier version of
 this document reported 8 MB for the no-NVML build; that was the RSS of `sudo`,
 measured instead of the process it started.
 
@@ -198,9 +224,10 @@ AutoFan does not use `ipmitool sdr`; it calls NVML in process and spends no
 processes on reading, which is cheaper per sample than fanctl's 183 ms and the
 appropriate design for a program that watches only GPUs. It also cannot read the
 CPU or the case air, has one curve per GPU set rather than per zone, and
-initialises the driver library every interval. fanctl spends one `ipmitool`
-process per cycle because it needs the BMC for CPU, VRM and air sensors, which
-NVML does not expose; once that process exists, adding a sensor costs 13–17 ms.
+initialises the driver library every interval, which costs 26.5 ms to give the
+20 MB of driver heap back between samples. fanctl spends one `ipmitool` process
+per cycle because it needs the BMC for CPU, VRM and air sensors, which NVML does
+not expose; once that process exists, adding a sensor costs 13–17 ms.
 
 On writes fanctl is roughly 3× faster per change, because it starts one
 `ipmitool` per cycle instead of one per pin.
@@ -216,7 +243,7 @@ On writes fanctl is roughly 3× faster per change, because it starts one
    twenty in `platform.toml` costs nothing, watching them costs 13–17 ms each per
    cycle.
 3. **Build without the GPU feature** on a host without an NVIDIA card: 106 KB of
-   binary and 25 MB of resident memory.
+   binary and 20 MB of driver heap.
 4. **Drop the tachometers** if the log does not need speeds: seven readings
    become four, 183 ms becomes 130 ms.
 
