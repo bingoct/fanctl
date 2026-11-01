@@ -43,12 +43,6 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 /// healthy idle machine and a dead one both produce silence.
 const HEARTBEAT: Duration = Duration::from_secs(300);
 
-/// How far a temperature has to move before the cycle line is worth repeating.
-///
-/// A BMC reports whole degrees and an idle EPYC wanders between 22 and 24, so a
-/// threshold of 2 C produced three lines a minute with nothing running.
-const REPORT_STEP_CELSIUS: f64 = 3.0;
-
 /// Source names of a zone, for the log lines that explain a missing reading.
 fn source_labels(zone: &ZoneConfig) -> Vec<String> {
     zone.sources.iter().map(Source::label).collect()
@@ -57,8 +51,8 @@ fn source_labels(zone: &ZoneConfig) -> Vec<String> {
 /// Every temperature a snapshot holds, in a stable order.
 ///
 /// Sorted because the IPMI readings live in a `HashMap`: an unstable order
-/// would make two identical cycles compare as different, and the comparison is
-/// what rate limits the log line.
+/// would make two identical cycles print differently, and a log whose lines
+/// cannot be compared is not evidence of anything.
 fn temperatures(snapshot: &SensorSnapshot) -> Vec<(String, f64)> {
     let mut temps: Vec<(String, f64)> = snapshot
         .ipmi
@@ -97,22 +91,25 @@ fn stalled<'a>(previous: Option<&[(String, u32)]>, current: &'a [(String, u32)])
         .collect()
 }
 
-/// `true` when the cycle line is worth emitting at INFO.
+/// The temperatures as one space-free field, for the duty cycle lines.
 ///
-/// Nothing to compare against (first cycle) counts as a change. A sensor that
-/// appeared or vanished also counts: `04` means a zone is now blind, and that
-/// must not be swallowed by the change filter.
-fn temperatures_moved(previous: Option<&[(String, f64)]>, current: &[(String, f64)]) -> bool {
-    let Some(previous) = previous else {
-        return true;
-    };
-    previous.len() != current.len()
-        || current
-            .iter()
-            .zip(previous)
-            .any(|((name, celsius), (was_name, was))| {
-                name != was_name || (celsius - was).abs() >= REPORT_STEP_CELSIUS
-            })
+/// The cycle line carries the temperatures on its own once every
+/// [`HEARTBEAT`]. This is the copy that travels with the event they caused, so
+/// a duty cycle step can be read without hunting for the nearest `cycle temps`.
+///
+/// ```text
+/// pin=SYS_FAN_2 from=30 to=35 temps=CPU_Tctl:26.0,GPU0:55.0,GPU1:26.0
+/// ```
+fn temperatures_field(snapshot: &SensorSnapshot) -> String {
+    let temps = temperatures(snapshot);
+    if temps.is_empty() {
+        return String::from("none");
+    }
+    temps
+        .iter()
+        .map(|(name, celsius)| format!("{name}:{celsius:.1}"))
+        .collect::<Vec<String>>()
+        .join(",")
 }
 
 /// Builds the one-line summary of a cycle: every temperature, every measured
@@ -173,10 +170,8 @@ pub struct Engine {
     /// Consecutive cycles each zone has gone without a reading.
     zone_misses: Vec<u32>,
     last_sent: BTreeMap<String, u8>,
-    /// Temperatures as of the last reported cycle line - the comparison that
-    /// keeps an idle machine from logging every ten seconds - the fan speeds as
-    /// of that cycle, for stall detection, and when the line was last sent.
-    last_temperatures: Option<Vec<(String, f64)>>,
+    /// Fan speeds as of the last reported cycle, for stall detection, and when
+    /// the cycle line was last emitted at INFO.
     last_fans: Option<Vec<(String, u32)>>,
     last_report_at: Option<Instant>,
     /// Pins at least one zone drives; the only ones the daemon may write.
@@ -214,7 +209,6 @@ impl Engine {
             zone_duties: vec![None; zone_count],
             zone_misses: vec![0; zone_count],
             last_sent: BTreeMap::new(),
-            last_temperatures: None,
             last_fans: None,
             last_report_at: None,
             driven,
@@ -354,7 +348,7 @@ impl Engine {
 
             // Forced, not deduplicated: a BMC that just rebooted has forgotten
             // the duty cycles, and `last_sent` still believes otherwise.
-            self.write_targets(&targets, true);
+            self.write_targets(&targets, true, &snapshot);
             // Still reported: a BMC that answers nothing is exactly when an
             // operator needs to see that the loop is running.
             self.report_cycle(&snapshot);
@@ -457,13 +451,13 @@ impl Engine {
             targets
         };
 
-        self.dispatch(&targets);
+        self.dispatch(&targets, &snapshot);
         self.report_cycle(&snapshot);
     }
 
     /// Sends the pins whose duty cycle differs from what was last accepted.
-    fn dispatch(&mut self, targets: &TargetMap) {
-        self.write_targets(targets, false);
+    fn dispatch(&mut self, targets: &TargetMap, snapshot: &SensorSnapshot) {
+        self.write_targets(targets, false, snapshot);
     }
 
     /// Writes every pin in `targets` in one `ipmitool exec`.
@@ -475,7 +469,7 @@ impl Engine {
     ///
     /// Only pins the batch confirmed are recorded, so a pin the BMC refused is
     /// retried on the next cycle instead of being remembered as applied.
-    fn write_targets(&mut self, targets: &TargetMap, force: bool) {
+    fn write_targets(&mut self, targets: &TargetMap, force: bool, snapshot: &SensorSnapshot) {
         let pending: Vec<(&str, u8)> = targets
             .iter()
             .filter(|(pin, duty_cycle)| force || self.last_sent.get(*pin) != Some(*duty_cycle))
@@ -493,6 +487,10 @@ impl Engine {
 
         match self.actuator.apply_batch(&pending) {
             Ok(unconfirmed) => {
+                // The effect carries its cause. The cycle line is only a
+                // five-minute sample, so without this a step at 14:59 would be
+                // explained by a temperature from 14:55.
+                let temps = temperatures_field(snapshot);
                 for (index, &(pin, duty_cycle)) in pending.iter().enumerate() {
                     if unconfirmed.iter().any(|failed| failed.as_str() == pin) {
                         continue;
@@ -505,10 +503,18 @@ impl Engine {
                         continue;
                     }
                     match previous[index] {
-                        Some(from) => {
-                            info!(pin = %pin, from, to = duty_cycle, "duty cycle changed")
-                        }
-                        None => info!(pin = %pin, to = duty_cycle, "duty cycle set"),
+                        Some(from) => info!(
+                            pin = %pin,
+                            from,
+                            to = duty_cycle,
+                            temps = %temps,
+                            "duty cycle changed"
+                        ),
+                        // The first write of a pin has no previous value and no
+                        // temperature to blame: it is the daemon asserting the
+                        // curve, not a reaction to anything. The cycle line that
+                        // follows carries the readings.
+                        None => info!(pin = %pin, to = duty_cycle, "duty cycle initialised"),
                     }
                 }
             }
@@ -522,11 +528,14 @@ impl Engine {
 
     /// Emits the per-cycle temperature line.
     ///
-    /// At INFO when a temperature moved by [`REPORT_STEP_CELSIUS`] or when
-    /// [`HEARTBEAT`] has passed, at DEBUG otherwise. Fan speeds are carried in
-    /// the line but do not decide it: a tachometer wanders by a count or two on
-    /// its own, and a speed that changed while the temperature did not is not
-    /// worth a line of its own.
+    /// At INFO once [`HEARTBEAT`] has passed, at DEBUG otherwise, so the line is
+    /// a predictable sample rather than a change log. A temperature that moved
+    /// is only interesting when it moved a fan, and that case has a line of its
+    /// own with the temperatures attached ([`temperatures_field`]).
+    ///
+    /// Fan speeds are carried in the line but do not decide it: a tachometer
+    /// wanders by a count or two on its own, and a speed that changed while the
+    /// temperature did not is not worth a line of its own.
     ///
     /// This is the daemon's only routine statement that it is still turning,
     /// and the source a temperature curve is drawn from.
@@ -540,7 +549,6 @@ impl Engine {
                 .zip(self.zone_duties.iter().copied()),
         );
 
-        let temps = temperatures(snapshot);
         let fans = snapshot.fans.clone();
 
         // A fan that stops turning gets a line of its own even though the cycle
@@ -558,20 +566,16 @@ impl Engine {
             }
         }
 
-        // A BMC reads whole degrees, so only a move above the idle flicker is
-        // news.
-        let moved = temperatures_moved(self.last_temperatures.as_deref(), &temps);
         let due = self
             .last_report_at
             .is_none_or(|at| at.elapsed() >= HEARTBEAT);
 
-        if !moved && !due {
+        if !due {
             debug!("{line}");
             return;
         }
 
         info!("{line}");
-        self.last_temperatures = Some(temps);
         self.last_fans = Some(fans);
         self.last_report_at = Some(Instant::now());
     }
@@ -593,7 +597,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{cycle_line, stalled, temperatures_moved};
+    use super::{cycle_line, stalled, temperatures_field};
     use crate::sensors::SensorSnapshot;
 
     fn duties(
@@ -640,56 +644,18 @@ mod tests {
         assert_eq!(line, "cycle temps none | duty cpu=?");
     }
 
-    fn temps(pairs: &[(&str, f64)]) -> Vec<(String, f64)> {
-        pairs
-            .iter()
-            .map(|(name, celsius)| ((*name).to_string(), *celsius))
-            .collect()
+    #[test]
+    fn the_duty_line_carries_the_temperatures_that_caused_it() {
+        let mut snapshot = SensorSnapshot::default();
+        snapshot.ipmi.insert("CPU_Tctl".to_string(), 26.0);
+        snapshot.gpus.push((0, "RTX 3080".to_string(), 55.0));
+
+        assert_eq!(temperatures_field(&snapshot), "CPU_Tctl:26.0,GPU0:55.0");
     }
 
     #[test]
-    fn the_idle_flicker_is_not_a_change() {
-        // An idle BMC reports whole degrees and wanders between 22 and 24 all
-        // day. Treating that as news would log every ten seconds on a machine
-        // that is doing nothing.
-        let previous = temps(&[("CPU_Tctl", 22.0)]);
-        assert!(!temperatures_moved(
-            Some(&previous),
-            &temps(&[("CPU_Tctl", 23.0)])
-        ));
-        assert!(!temperatures_moved(
-            Some(&previous),
-            &temps(&[("CPU_Tctl", 24.0)])
-        ));
-    }
-
-    #[test]
-    fn three_degrees_is_a_change() {
-        let previous = temps(&[("CPU_Tctl", 22.0)]);
-        assert!(temperatures_moved(
-            Some(&previous),
-            &temps(&[("CPU_Tctl", 25.0)])
-        ));
-        assert!(temperatures_moved(
-            Some(&previous),
-            &temps(&[("CPU_Tctl", 19.0)])
-        ));
-    }
-
-    #[test]
-    fn a_sensor_that_comes_or_goes_is_a_change() {
-        // A disappearing sensor means a zone went blind; the change filter must
-        // not eat that.
-        let previous = temps(&[("CPU_Tctl", 22.0), ("GPU0", 30.0)]);
-        assert!(temperatures_moved(
-            Some(&previous),
-            &temps(&[("CPU_Tctl", 22.0)])
-        ));
-    }
-
-    #[test]
-    fn the_first_cycle_always_reports() {
-        assert!(temperatures_moved(None, &temps(&[("CPU_Tctl", 22.0)])));
+    fn a_duty_line_without_readings_says_none() {
+        assert_eq!(temperatures_field(&SensorSnapshot::default()), "none");
     }
 
     fn fans(pairs: &[(&str, u32)]) -> Vec<(String, u32)> {

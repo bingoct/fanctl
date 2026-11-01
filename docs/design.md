@@ -209,21 +209,34 @@ two identical cycles look different.
 
 The line is both machine-readable (it is the data source for a temperature
 curve) and the routine proof that the loop is still running. A line every cycle
-would be 8 600 lines a day for an idle machine, so the level is chosen by
-change:
+would be 8 600 lines a day for an idle machine, so it is emitted once every five
+minutes and at DEBUG in between:
 
 | Event | Level |
 | --- | --- |
-| any temperature moved ≥ 3 °C | INFO |
-| a temperature appeared or disappeared | INFO |
-| nothing moved, under 5 minutes since the last INFO line | DEBUG |
-| nothing moved, 5 minutes elapsed | INFO |
+| 5 minutes since the last cycle line | INFO |
+| under 5 minutes, nothing else to say | DEBUG |
+| a duty cycle changed | INFO, with the temperatures attached |
 | a driven fan went from turning to zero | WARN |
 
-The threshold follows from the hardware: the BMC reports whole degrees and an
-idle EPYC wanders between 22 and 24 °C, which logged three lines a minute at a
-2 °C threshold; 3 °C is above that flicker, and a real load crosses it within a
-cycle or two.
+Nothing else decides the level. An earlier version also promoted the line when
+any temperature moved 3 °C, to record transients between heartbeats. On an idle
+machine that threshold sits exactly on the flicker of `CPU_Tctl`, which wanders
+21-24 °C: 189 of 295 intervals in one day were temperature triggers, 113 of them
+that flicker, and the real heartbeat got through only 60 times. A temperature
+that moved is interesting when it moved a fan, and that case has a line of its
+own:
+
+```text
+duty cycle changed pin=SYS_FAN_2 from=30 to=35 temps=CPU_Tctl:26.0,GPU0:55.0,GPU1:26.0
+```
+
+The cause travels with the effect, so a five-minute sample never has to explain
+a step that happened four minutes earlier.
+
+The first write of each pin after start is logged as `duty cycle initialised`
+and carries no temperature: nothing caused it, the daemon is just asserting the
+curve on a pin whose previous value it never saw.
 
 Fan speed is in the line but not in the decision. A tachometer reading wanders
 by a count or two on its own - the pump at 100 % alternates between 5934 and
