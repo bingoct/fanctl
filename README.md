@@ -2,49 +2,51 @@
 
 **English** · [简体中文](README-cn.md)
 
-Temperature-driven fan control for server boards whose BMC fan policy cannot be
-used. Reads temperatures, converts them to duty cycles through per-zone curves,
-writes the result back over IPMI raw.
+When a server board's BMC fan policy is unusable, fanctl controls fan speed:
+it reads temperatures, converts them to duty cycles through per-zone curves,
+and writes the result back to the BMC over IPMI raw.
 
 ## Features
 
-- **Temperature-driven control.** One step curve per zone. A rising temperature
-  jumps immediately, possibly several steps; a falling one waits for
-  `debounce_celsius`. [Design](docs/design.md#the-curve)
+- **Temperature control.** One step curve per zone. A rise jumps steps
+  immediately, possibly several at once; a fall drops one step only after
+  crossing `debounce_celsius`. [Design](docs/design.md#the-curve)
 - **Board decoupled.** Hardware in `platform.toml`, policy in `config.toml`,
   validated as a pair. [Platform](docs/platform.md) ·
   [Configuration](docs/config.md)
-- **Zones.** Any number of inputs per zone: one BMC sensor, a single GPU, or the
-  hottest of all GPUs. [Design](docs/design.md#aggregation)
-- **Coupling.** A pin shared by several zones takes the highest duty cycle;
-  `[[follows]]` adds fixed constraints between pins.
+- **Zones.** A zone references any number of inputs: one BMC sensor, one GPU,
+  the maximum over all GPUs. [Design](docs/design.md#aggregation)
+- **Coupling.** A pin shared by several zones takes the maximum duty cycle;
+  `[[follows]]` expresses fixed constraints between pins.
   [Design](docs/design.md#merging)
-- **IPMI raw.** Only the sensors a zone names are read, in one `ipmitool`
+- **IPMI raw.** Only the sensors a zone references are read, one `ipmitool`
   process per cycle. [Design](docs/design.md#reading)
-- **Failure policy.** A zone with no reading holds its step, then drops to its
-  fallback; a write the BMC did not acknowledge is retried.
-  [Design](docs/design.md#when-a-reading-disappears)
-- **Tachometer readback.** Speeds are logged and a fan that stops raises a
-  warning; the curve does not read them. [Design](docs/design.md#per-cycle-log)
+- **Failure policy.** A zone with no reading holds its current step, then drops
+  to `fallback_duty_cycle`; a write the BMC did not acknowledge is resent next
+  cycle. [Design](docs/design.md#when-a-reading-disappears)
+- **Tachometer readback.** Fan speeds are logged and a stopped fan raises an
+  alarm; speeds do not feed the curve. [Design](docs/design.md#per-cycle-log)
 
 ## Verified boards
 
 | Board | Notes |
 | --- | --- |
-| TYAN S8030GM2NE | 4 PWM channels, sensor numbers 0x60–0x64, tachometer scale 138 RPM/count |
+| TYAN S8030GM2NE | 4 PWM channels, sensor numbers 0x60–0x64, tach scale 138 RPM/count |
 
-A different board needs its own `platform.toml`. [docs/platform.md](docs/platform.md)
-documents the fields, how to find the numbers, and how to add one.
+A new board needs its own `platform.toml`: field reference, how to find sensor
+numbers, and how to add a board are in
+[docs/platform.md](docs/platform.md).
 
 ## Requirements
 
 - Linux with systemd.
-- `ipmitool` ≥ 1.8 with access to `/dev/ipmi0` (root, or a udev rule granting
+- `ipmitool` ≥ 1.8, able to open `/dev/ipmi0` (root, or a udev rule granting
   `CAP_SYS_RAWIO`).
-- A BMC that accepts a raw PWM command.
-- Rust 1.84 or later to build (`resolver = "3"`). `Cargo.lock` is committed.
-- Optional: the NVIDIA driver and NVML for GPU temperatures. Build with
-  `--no-default-features` on a host without it.
+- A BMC that exposes writable raw PWM commands.
+- Rust 1.84 or later to build (the lower bound for `resolver = "3"`).
+  `Cargo.lock` is committed.
+- GPU temperatures need the NVIDIA driver and NVML; on a host without the
+  driver, build with `--no-default-features`.
 
 ## Install
 
@@ -61,48 +63,49 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
 ```
 
-`examples/` holds the reference configuration for the S8030.
+`examples/` is the reference configuration for the S8030.
 
 ## Use
 
 ```bash
-# Validate both files and probe the hardware: check sensor numbers,
-# cross-check raw readings, list the GPUs, do one batched read. Writes no PWM.
+# Validate both configurations and probe the hardware: check sensor numbers,
+# cross-validate raw readings, list the GPUs, do one batched read.
+# Writes no PWM.
 sudo fanctl check
 
-# Run the control loop without sending PWM commands.
+# Run the full control loop without sending PWM commands.
 sudo fanctl run --dry-run -v
 
 # Run in the foreground, supervised by systemd.
 sudo fanctl run
 ```
 
-Exit code is 0 on a clean shutdown, 1 on a configuration or hardware error. The
-log line, its rate limits and the shutdown behaviour are in
+A clean exit returns 0; a configuration or hardware error returns 1. The log
+format, its rate limits and the shutdown reset are in
 [docs/design.md](docs/design.md#per-cycle-log).
 
 ## Configuration
 
 | File | Content | Documentation |
 | --- | --- | --- |
-| `/etc/fanctl/platform.toml` | hardware: pin ids, sensor numbers, command template, tachometer scale | [docs/platform.md](docs/platform.md) |
-| `/etc/fanctl/config.toml` | policy: zones, curves, coupling, fallbacks | [docs/config.md](docs/config.md) |
+| `/etc/fanctl/platform.toml` | hardware: pin ids, sensor numbers, command template, tach scale | [docs/platform.md](docs/platform.md) |
+| `/etc/fanctl/config.toml` | policy: zones, curves, coupling, fallback | [docs/config.md](docs/config.md) |
 
-Both files are validated at startup and by `fanctl check`; unknown keys are an
-error. Names are compared case-insensitively.
+Both files are validated at startup and by `fanctl check`; unknown fields are
+an error. Name matching is case-insensitive.
 
 ## Documentation
 
 | Document | Content |
 | --- | --- |
-| [docs/design.md](docs/design.md) | the cycle, the read protocol, aggregation, curve and debounce, merging, failure policy, logging, safety limits |
-| [docs/config.md](docs/config.md) | every `config.toml` field with defaults, validation rules, a complete example |
+| [docs/design.md](docs/design.md) | cycle flow, read/write protocol, aggregation, curve and hysteresis, merging, failure policy, logging, safety limits |
+| [docs/config.md](docs/config.md) | every `config.toml` field with defaults, validation rules, a full example |
 | [docs/platform.md](docs/platform.md) | `platform.toml` fields, finding sensor numbers and PWM channels, adding a board |
-| [docs/cost.md](docs/cost.md) | measured read and write times, binary composition, resident memory, comparison with a similar implementation |
+| [docs/cost.md](docs/cost.md) | measured read/write times, binary composition, resident memory, comparison with similar implementations |
 
 ## Development
 
-Most of the code was written by an AI agent, checked by the test suite and
+Most of the code was written by AI agents, checked by the test suite and
 reviewed by the maintainer.
 
 ```bash
@@ -112,9 +115,10 @@ cargo test
 npx markdownlint-cli2 "**/*.md"
 ```
 
-Hardware constants belong in `platform.toml`, not in `src/`. A new GPU backend
-plugs into the `Source` enum in `src/sensors.rs`; a board that publishes GPU
-temperatures as IPMI sensors needs no code, only `[sensors]` entries.
+Hardware constants live only in `platform.toml`, never in `src/`. A new GPU
+backend goes into the `Source` enum in `src/sensors.rs`; once GPU temperatures
+are published as IPMI sensors, a new board needs only `[sensors]` entries, no
+code.
 
 ## License
 
