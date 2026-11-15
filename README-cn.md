@@ -2,8 +2,8 @@
 
 [English](README.md) · **简体中文**
 
-服务器主板的 BMC 风扇策略不可用时，用 fanctl 控速：读温度，按分区曲线换算成占空比，
-通过 IPMI raw 写回 BMC。
+服务器主板的 BIOS 不会按温度调风扇转速时，用 fanctl 接管：读温度，按分区曲线换算成
+占空比，通过 IPMI raw 写回 BMC。
 
 ## 特性
 
@@ -54,9 +54,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
 ```
 
-`examples/` 是 S8030 的参考配置。
+`examples/` 是 S8030 的参考配置。换主板先按 [docs/platform-cn.md](docs/platform-cn.md)
+写出自己的 `platform.toml`，再改 `config.toml`，最后两行 systemd 步骤留到那时再执行。
 
 ## 使用
+
+启动服务前先看[配置](#配置)一节：分区、曲线、兜底占空比都在 `config.toml` 里，
+仓库带的示例只描述 S8030 这一台机器。
 
 ```bash
 # 校验两份配置并探测硬件：核对传感器编号、交叉验证 raw 读数、列出显卡、

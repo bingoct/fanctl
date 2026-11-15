@@ -3,8 +3,8 @@
 **English** · [简体中文](config-cn.md)
 
 `config.toml` describes the policy: how fast the fans turn at a given
-temperature. It contains no hardware knowledge; the pin and sensor names it
-references resolve through [`platform.toml`](platform.md), case-insensitively.
+temperature. The pin and sensor names it references resolve through
+[`platform.toml`](platform.md), case-insensitively.
 
 Related: [design](design.md) · [platform](platform.md) · [cost](cost.md)
 

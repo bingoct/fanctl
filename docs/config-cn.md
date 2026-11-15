@@ -2,8 +2,8 @@
 
 [English](config.md) · **简体中文**
 
-`config.toml` 描述策略：某个温度下风扇转多快。它不含硬件知识；引用的引脚名与
-传感器名都通过 [`platform.toml`](platform-cn.md) 解析，不区分大小写。
+`config.toml` 描述策略：某个温度下风扇转多快。引用的引脚名与传感器名都通过
+[`platform.toml`](platform-cn.md) 解析，不区分大小写。
 
 相关：[设计](design-cn.md) · [主板](platform-cn.md) · [开销](cost-cn.md)
 

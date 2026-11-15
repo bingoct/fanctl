@@ -2,9 +2,9 @@
 
 **English** · [简体中文](README-cn.md)
 
-When a server board's BMC fan policy is unusable, fanctl controls fan speed:
-it reads temperatures, converts them to duty cycles through per-zone curves,
-and writes the result back to the BMC over IPMI raw.
+When a server board's BIOS does not regulate fan speed by temperature, fanctl
+takes over: it reads temperatures, converts them to duty cycles through
+per-zone curves, and writes the result back to the BMC over IPMI raw.
 
 ## Features
 
@@ -63,9 +63,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fanctl
 ```
 
-`examples/` is the reference configuration for the S8030.
+`examples/` is the reference configuration for the S8030. On a different
+board, write your own `platform.toml` first
+(see [docs/platform.md](docs/platform.md)), then edit `config.toml`; run
+the last two systemd steps only after that.
 
 ## Use
+
+Before starting the service, read the [Configuration](#configuration)
+section: zones, curves, and fallback duty cycles live in `config.toml`,
+and the examples in this repository describe one machine, the S8030.
 
 ```bash
 # Validate both configurations and probe the hardware: check sensor numbers,
